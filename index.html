@@ -1,0 +1,669 @@
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Motion Tracker — Webカメラ・モーショントラッキング</title>
+<style>
+  :root {
+    --bg: #070a0f;
+    --panel: #0e131c;
+    --panel-2: #131a26;
+    --line: #1f2937;
+    --text: #e5edf5;
+    --muted: #8a97a8;
+    --cyan: #22d3ee;
+    --green: #34d399;
+    --magenta: #f472b6;
+    --danger: #f87171;
+    --radius: 16px;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background:
+      radial-gradient(1200px 600px at 80% -10%, rgba(34,211,238,0.10), transparent 60%),
+      radial-gradient(900px 500px at -10% 110%, rgba(244,114,182,0.08), transparent 55%),
+      var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Yu Gothic UI", "Segoe UI", system-ui, sans-serif;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 28px 20px 56px; }
+
+  header { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; margin-bottom: 22px; }
+  header h1 {
+    font-size: 22px; margin: 0; letter-spacing: .3px;
+    background: linear-gradient(90deg, var(--cyan), var(--green));
+    -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
+  }
+  header .sub { color: var(--muted); font-size: 13px; }
+
+  .app { display: grid; grid-template-columns: 1fr 320px; gap: 20px; align-items: start; }
+  @media (max-width: 900px) { .app { grid-template-columns: 1fr; } }
+
+  /* ---- Stage ---- */
+  .stage {
+    position: relative; border-radius: var(--radius); overflow: hidden;
+    background: #000; border: 1px solid var(--line);
+    box-shadow: 0 24px 60px rgba(0,0,0,.45), inset 0 0 0 1px rgba(255,255,255,.02);
+    aspect-ratio: 16 / 9;
+  }
+  #overlay { display: block; width: 100%; height: 100%; object-fit: contain; background: #000; }
+  #webcam { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; top: 0; left: 0; }
+
+  .status {
+    position: absolute; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 14px;
+    text-align: center; padding: 24px;
+    background: radial-gradient(circle at center, rgba(7,10,15,.35), rgba(7,10,15,.75));
+    backdrop-filter: blur(2px); transition: opacity .2s ease;
+  }
+  .status[hidden] { display: none; }
+  .status .big { font-size: 16px; font-weight: 600; }
+  .status .small { font-size: 13px; color: var(--muted); max-width: 460px; }
+  .status.error .big { color: var(--danger); }
+  .spinner {
+    width: 34px; height: 34px; border-radius: 50%;
+    border: 3px solid rgba(255,255,255,.15); border-top-color: var(--cyan);
+    animation: spin 0.9s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .play-badge {
+    width: 64px; height: 64px; border-radius: 50%;
+    display: grid; place-items: center; font-size: 26px;
+    background: linear-gradient(135deg, var(--cyan), var(--green)); color: #04121a;
+    box-shadow: 0 10px 30px rgba(34,211,238,.35);
+  }
+
+  /* HUD chips over the stage */
+  .hud { position: absolute; top: 12px; left: 12px; display: flex; gap: 8px; pointer-events: none; }
+  .chip {
+    font-variant-numeric: tabular-nums; font-size: 12px; font-weight: 600;
+    padding: 5px 10px; border-radius: 999px; color: var(--text);
+    background: rgba(8,12,18,.62); border: 1px solid rgba(255,255,255,.08);
+    backdrop-filter: blur(6px);
+  }
+  .chip b { color: var(--cyan); }
+  .chip.rec b { color: var(--green); }
+
+  /* ---- Controls ---- */
+  .panel {
+    background: linear-gradient(180deg, var(--panel), var(--panel-2));
+    border: 1px solid var(--line); border-radius: var(--radius);
+    padding: 18px; display: flex; flex-direction: column; gap: 18px;
+  }
+  .panel section { display: flex; flex-direction: column; gap: 10px; }
+  .panel .label { font-size: 11px; letter-spacing: .12em; text-transform: uppercase; color: var(--muted); }
+
+  button { font-family: inherit; cursor: pointer; border: none; color: inherit; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+
+  .btn-primary {
+    width: 100%; padding: 13px 16px; border-radius: 12px; font-size: 15px; font-weight: 700;
+    background: linear-gradient(135deg, var(--cyan), var(--green)); color: #04121a;
+    transition: transform .08s ease, filter .15s ease;
+  }
+  .btn-primary:hover:not(:disabled) { filter: brightness(1.06); }
+  .btn-primary:active:not(:disabled) { transform: translateY(1px); }
+  .btn-primary.stop { background: linear-gradient(135deg, #fb7185, #f59e0b); color: #1a0a04; }
+
+  .seg { display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px; background: #0a0f17; padding: 5px; border-radius: 12px; border: 1px solid var(--line); }
+  .seg button {
+    padding: 9px 6px; border-radius: 8px; font-size: 13px; font-weight: 600; color: var(--muted);
+    background: transparent; transition: all .15s ease; display: flex; flex-direction: column; align-items: center; gap: 2px;
+  }
+  .seg button .ico { font-size: 16px; }
+  .seg button.active { color: #04121a; background: linear-gradient(135deg, var(--cyan), var(--green)); }
+  .seg button:not(.active):hover { color: var(--text); background: rgba(255,255,255,.04); }
+
+  .toggles { display: flex; flex-direction: column; gap: 8px; }
+  .toggle {
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    padding: 10px 12px; border-radius: 10px; background: #0a0f17; border: 1px solid var(--line);
+    font-size: 14px; user-select: none;
+  }
+  .toggle .sw { width: 40px; height: 23px; border-radius: 999px; background: #2b3647; position: relative; transition: background .15s ease; flex: none; }
+  .toggle .sw::after { content: ""; position: absolute; top: 3px; left: 3px; width: 17px; height: 17px; border-radius: 50%; background: #e5edf5; transition: transform .15s ease; }
+  .toggle[aria-pressed="true"] .sw { background: linear-gradient(135deg, var(--cyan), var(--green)); }
+  .toggle[aria-pressed="true"] .sw::after { transform: translateX(17px); }
+
+  .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .stat { background: #0a0f17; border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
+  .stat .v { font-size: 22px; font-weight: 800; font-variant-numeric: tabular-nums; color: var(--cyan); line-height: 1.1; }
+  .stat .k { font-size: 11px; color: var(--muted); letter-spacing: .08em; text-transform: uppercase; }
+
+  .btn-ghost { width: 100%; padding: 11px; border-radius: 10px; font-size: 14px; font-weight: 600; color: var(--text); background: #0a0f17; border: 1px solid var(--line); transition: border-color .15s ease, background .15s ease; }
+  .btn-ghost:hover:not(:disabled) { border-color: var(--cyan); background: rgba(34,211,238,.06); }
+
+  .note { font-size: 12px; color: var(--muted); line-height: 1.6; }
+  .note code { background: #0a0f17; border: 1px solid var(--line); padding: 1px 6px; border-radius: 6px; color: var(--green); font-size: 12px; }
+  .insecure { display: none; margin-top: 14px; padding: 12px 14px; border-radius: 10px; background: rgba(248,113,113,.1); border: 1px solid rgba(248,113,113,.35); color: #fecaca; font-size: 13px; }
+  .insecure code { color: #fecaca; background: rgba(0,0,0,.25); border-color: rgba(248,113,113,.3); }
+  footer { margin-top: 26px; color: var(--muted); font-size: 12px; }
+</style>
+
+<div class="wrap">
+  <header>
+    <h1>● Motion Tracker</h1>
+    <span class="sub">Webカメラ × リアルタイム・モーショントラッキング（MediaPipe）</span>
+  </header>
+
+  <div class="app">
+    <!-- Stage -->
+    <div class="stage">
+      <video id="webcam" autoplay muted playsinline></video>
+      <canvas id="overlay" width="1280" height="720"></canvas>
+
+      <div class="hud">
+        <span class="chip">FPS <b id="fps">–</b></span>
+        <span class="chip rec">検出 <b id="count">0</b></span>
+      </div>
+
+      <div class="status" id="status">
+        <div class="play-badge">▶</div>
+        <div class="big">「カメラ開始」を押してください</div>
+        <div class="small">ブラウザがカメラの使用許可を求めます。「許可」を選んでください。</div>
+      </div>
+    </div>
+
+    <!-- Controls -->
+    <div class="panel">
+      <section>
+        <button id="toggleCam" class="btn-primary">▶ カメラ開始</button>
+      </section>
+
+      <section>
+        <span class="label">トラッキング対象</span>
+        <div class="seg" id="modeSeg" role="tablist">
+          <button data-mode="pose"  class="active"><span class="ico">🧍</span>ポーズ</button>
+          <button data-mode="hand"><span class="ico">✋</span>ハンド</button>
+          <button data-mode="face"><span class="ico">😊</span>フェイス</button>
+          <button data-mode="holistic"><span class="ico">🤸</span>全身＋指＋顔</button>
+        </div>
+      </section>
+
+      <section>
+        <span class="label">表示オプション</span>
+        <div class="toggles">
+          <div class="toggle" id="tglMirror" aria-pressed="true" role="button" tabindex="0"><span>ミラー表示（自撮り）</span><span class="sw"></span></div>
+          <div class="toggle" id="tglVideo" aria-pressed="true" role="button" tabindex="0"><span>カメラ映像を表示</span><span class="sw"></span></div>
+          <div class="toggle" id="tglTrail" aria-pressed="true" role="button" tabindex="0"><span>軌跡エフェクト</span><span class="sw"></span></div>
+        </div>
+      </section>
+
+      <section>
+        <span class="label">ステータス</span>
+        <div class="stats">
+          <div class="stat"><div class="v" id="fps2">–</div><div class="k">FPS</div></div>
+          <div class="stat"><div class="v" id="count2">0</div><div class="k" id="countLabel">検出数</div></div>
+        </div>
+      </section>
+
+      <section>
+        <button id="snap" class="btn-ghost" disabled>📸 スナップショットを保存</button>
+      </section>
+
+      <div class="note" id="modeHint"></div>
+      <div class="insecure" id="insecure"></div>
+    </div>
+  </div>
+
+  <footer>
+    ブラウザ内で完結（映像は外部に送信されません）。動かすには <code>python3 -m http.server 8000</code> でこのフォルダを配信し、
+    <code>http://localhost:8000</code> を Chrome / Safari で開いてください。
+  </footer>
+</div>
+
+<script type="module">
+  import {
+    FilesetResolver,
+    PoseLandmarker,
+    HandLandmarker,
+    FaceLandmarker,
+    HolisticLandmarker,
+    DrawingUtils,
+  } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/vision_bundle.mjs";
+
+  // ===== 検証済み定数（@0.10.35。import は .mjs ファイル、wasm は /wasm ディレクトリ。pin一致必須）=====
+  const WASM_URL = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/wasm";
+  const MODELS = {
+    pose: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task",
+    hand: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task",
+    face: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task",
+    holistic: "https://storage.googleapis.com/mediapipe-models/holistic_landmarker/holistic_landmarker/float16/latest/holistic_landmarker.task",
+  };
+  const COLORS = { cyan: "#22d3ee", green: "#34d399", magenta: "#f472b6", white: "#ffffff", yellow: "#fde047" };
+
+  // ===== DOM =====
+  const video = document.getElementById("webcam");
+  const canvas = document.getElementById("overlay");
+  const ctx = canvas.getContext("2d");
+  const du = new DrawingUtils(ctx); // 2Dコンテキスト形式（drawConnectors/drawLandmarksに必須）
+
+  const toggleCamBtn = document.getElementById("toggleCam");
+  const modeSeg = document.getElementById("modeSeg");
+  const snapBtn = document.getElementById("snap");
+  const statusEl = document.getElementById("status");
+  const fpsEl = document.getElementById("fps");
+  const fps2El = document.getElementById("fps2");
+  const countEl = document.getElementById("count");
+  const count2El = document.getElementById("count2");
+  const countLabelEl = document.getElementById("countLabel");
+  const modeHintEl = document.getElementById("modeHint");
+  const insecureEl = document.getElementById("insecure");
+  const tglMirror = document.getElementById("tglMirror");
+  const tglVideo = document.getElementById("tglVideo");
+  const tglTrail = document.getElementById("tglTrail");
+
+  const HINTS = {
+    pose: "全身33点の骨格を推定します。カメラから少し離れて全身を映すと安定します。",
+    hand: "両手・各21点の指の関節を検出します（最大2手）。手をはっきり映してください。",
+    face: "顔の468点メッシュ＋輪郭・目・虹彩・唇を描画します。",
+    holistic: "全身の骨格・両手の指・顔メッシュを1人ぶん同時に推定します（やや重め）。全身が映る距離で。",
+  };
+  const COUNT_LABELS = { pose: "人数", hand: "手の数", face: "顔の数", holistic: "検出パーツ" };
+
+  // ===== 状態 =====
+  let vision = null;                 // FilesetResolver（1回だけ生成して使い回す）
+  const landmarkers = {};            // モード別キャッシュ
+  const creating = {};               // 生成中プロミス（重複生成防止）
+  let mode = "pose";
+  let running = false;
+  let starting = false;              // start()の再入ガード（多重起動・ストリームリーク防止）
+  let rafId = null;
+  let stream = null;
+  let lastVideoTime = -1;
+  let lastResult = null;
+  const settings = { mirror: true, showVideo: true, trail: true };
+
+  // FPS計測
+  let fpsT0 = 0, fpsFrames = 0;
+  // 軌跡
+  let trail = [];
+  const TRAIL_LIFE = 650; // ms
+
+  // ===== ユーティリティ =====
+  function setStatus(kind, big, small) {
+    if (kind === "hide") { statusEl.hidden = true; return; }
+    statusEl.hidden = false;
+    statusEl.className = "status" + (kind === "error" ? " error" : "");
+    const icon = kind === "loading"
+      ? '<div class="spinner"></div>'
+      : kind === "error" ? '<div class="play-badge" style="background:#3a1414;color:#fca5a5">!</div>'
+      : '<div class="play-badge">▶</div>';
+    statusEl.innerHTML = icon +
+      '<div class="big">' + big + "</div>" +
+      (small ? '<div class="small">' + small + "</div>" : "");
+  }
+
+  function hexToRgba(hex, a) {
+    const n = parseInt(hex.slice(1), 16);
+    return "rgba(" + ((n >> 16) & 255) + "," + ((n >> 8) & 255) + "," + (n & 255) + "," + a + ")";
+  }
+
+  function paintIdleBackground() {
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+  }
+
+  // ===== Landmarker生成（遅延・キャッシュ・GPU→CPUフォールバック）=====
+  async function getLandmarker(m) {
+    if (landmarkers[m]) return landmarkers[m];
+    if (creating[m]) return creating[m];
+    creating[m] = (async () => {
+      if (!vision) vision = await FilesetResolver.forVisionTasks(WASM_URL);
+      const build = (delegate) => {
+        const baseOptions = { modelAssetPath: MODELS[m], delegate };
+        if (m === "pose")
+          return PoseLandmarker.createFromOptions(vision, { baseOptions, runningMode: "VIDEO", numPoses: 1 });
+        if (m === "hand")
+          return HandLandmarker.createFromOptions(vision, { baseOptions, runningMode: "VIDEO", numHands: 2 });
+        if (m === "face")
+          return FaceLandmarker.createFromOptions(vision, { baseOptions, runningMode: "VIDEO", numFaces: 1 });
+        // holistic: 全身＋両手＋顔を同時（人物1名固定・numPoses/numHands/numFaces は存在しない）
+        return HolisticLandmarker.createFromOptions(vision, { baseOptions, runningMode: "VIDEO" });
+      };
+      let lm;
+      try {
+        lm = await build("GPU");
+      } catch (e) {
+        console.warn("GPU初期化に失敗。CPUにフォールバックします。", e);
+        lm = await build("CPU");
+      }
+      landmarkers[m] = lm;
+      return lm;
+    })();
+    try {
+      return await creating[m];
+    } finally {
+      delete creating[m];
+    }
+  }
+
+  // ===== カメラ =====
+  function cameraErrorMessage(e) {
+    switch (e && e.name) {
+      case "NotAllowedError": return "カメラの使用が許可されませんでした。ブラウザのアドレスバーのカメラアイコンから許可してください。";
+      case "NotFoundError": return "カメラが見つかりませんでした。デバイスの接続を確認してください。";
+      case "NotReadableError": return "カメラが他のアプリで使用中の可能性があります。他のアプリを閉じて再試行してください。";
+      case "OverconstrainedError": return "要求した解像度に対応していません。";
+      default: return "カメラを起動できませんでした: " + (e && (e.name + " / " + e.message));
+    }
+  }
+
+  async function start() {
+    // 起動処理は数秒かかるため、その間の二度押し・多重起動を防ぐ
+    if (starting || running) return;
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setStatus("error", "このページではカメラを使えません",
+        "http://localhost で開く必要があります（file:// では動作しません）。");
+      return;
+    }
+    starting = true;
+    toggleCamBtn.disabled = true;
+    try {
+      setStatus("loading", "モデルを読み込み中…", "初回はモデルのダウンロードに数秒かかります。");
+      try {
+        await getLandmarker(mode);
+      } catch (e) {
+        setStatus("error", "モデルの読み込みに失敗しました", String(e && e.message || e));
+        return;
+      }
+      setStatus("loading", "カメラを起動中…");
+      // 既存ストリームが残っていれば確実に停止してから取得（多重取得・リーク防止）
+      if (stream) { stream.getTracks().forEach((t) => t.stop()); stream = null; }
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: false,
+          video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" },
+        });
+      } catch (e) {
+        setStatus("error", "カメラを起動できません", cameraErrorMessage(e));
+        return;
+      }
+      video.srcObject = stream;
+      // videoWidth/Height は loadedmetadata まで 0
+      await new Promise((res) => {
+        if (video.readyState >= 1) res();
+        else video.addEventListener("loadedmetadata", res, { once: true });
+      });
+      try { await video.play(); } catch (e) { console.warn("video.play()", e); }
+
+      // オーバーレイのサイズは実際に取得できた解像度に合わせる（CSSピクセルではなく）
+      canvas.width = video.videoWidth || 1280;
+      canvas.height = video.videoHeight || 720;
+
+      running = true;
+      lastVideoTime = -1;
+      lastResult = null;
+      trail = [];
+      fpsT0 = performance.now();
+      fpsFrames = 0;
+      setStatus("hide");
+      setRunningUI(true);
+      loop();
+    } finally {
+      starting = false;
+      toggleCamBtn.disabled = false;
+    }
+  }
+
+  function stop() {
+    running = false;
+    if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
+    if (stream) { stream.getTracks().forEach((t) => t.stop()); stream = null; }
+    video.srcObject = null;
+    lastResult = null;
+    trail = [];
+    paintIdleBackground();
+    setRunningUI(false);
+    setStatus("idle", "カメラ停止中", "「カメラ開始」で再開します。");
+  }
+
+  function setRunningUI(on) {
+    toggleCamBtn.textContent = on ? "■ カメラ停止" : "▶ カメラ開始";
+    toggleCamBtn.classList.toggle("stop", on);
+    snapBtn.disabled = !on;
+  }
+
+  // ===== 描画ループ =====
+  function loop() {
+    if (!running) return;
+    rafId = requestAnimationFrame(loop);
+    const now = performance.now();
+    const lm = landmarkers[mode];
+
+    // フレームが進んだ時だけ推論（timestampは単調増加のperformance.now()）
+    if (lm && video.videoWidth > 0 && video.currentTime !== lastVideoTime) {
+      lastVideoTime = video.currentTime;
+      try {
+        lastResult = lm.detectForVideo(video, now); // VIDEOモードは同期返り
+      } catch (e) {
+        console.error("detectForVideo", e);
+        lastResult = null;
+      }
+      pushTrail(lastResult, now);
+      updateCount(lastResult);
+    }
+
+    render(now);
+    updateFps(now);
+  }
+
+  function render(now) {
+    const w = canvas.width, h = canvas.height;
+
+    // 背景クリア（恒等変換に戻してから全面）
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, w, h);
+
+    // 映像とランドマークを同一の（必要なら反転した）座標系で描く＝常にズレない
+    ctx.save();
+    if (settings.mirror) { ctx.translate(w, 0); ctx.scale(-1, 1); }
+
+    if (settings.showVideo && video.videoWidth > 0) {
+      ctx.drawImage(video, 0, 0, w, h);
+    }
+    if (lastResult) drawResult(lastResult);
+    drawTrail(now, w, h);
+
+    ctx.restore();
+  }
+
+  // 顔メッシュ描画（FaceLandmarker / HolisticLandmarker どちらの静的定数でも使える）
+  function drawFaceMesh(lms, NS) {
+    if (!lms) return;
+    du.drawConnectors(lms, NS.FACE_LANDMARKS_TESSELATION, { color: "rgba(255,255,255,0.12)", lineWidth: 0.5 });
+    du.drawConnectors(lms, NS.FACE_LANDMARKS_FACE_OVAL, { color: COLORS.cyan, lineWidth: 2 });
+    du.drawConnectors(lms, NS.FACE_LANDMARKS_LIPS, { color: COLORS.magenta, lineWidth: 2 });
+    du.drawConnectors(lms, NS.FACE_LANDMARKS_LEFT_EYE, { color: COLORS.green, lineWidth: 2 });
+    du.drawConnectors(lms, NS.FACE_LANDMARKS_RIGHT_EYE, { color: COLORS.green, lineWidth: 2 });
+    du.drawConnectors(lms, NS.FACE_LANDMARKS_LEFT_EYEBROW, { color: COLORS.green, lineWidth: 2 });
+    du.drawConnectors(lms, NS.FACE_LANDMARKS_RIGHT_EYEBROW, { color: COLORS.green, lineWidth: 2 });
+    du.drawConnectors(lms, NS.FACE_LANDMARKS_LEFT_IRIS, { color: COLORS.yellow, lineWidth: 2 });
+    du.drawConnectors(lms, NS.FACE_LANDMARKS_RIGHT_IRIS, { color: COLORS.yellow, lineWidth: 2 });
+  }
+
+  function drawResult(res) {
+    if (mode === "pose") {
+      for (const lms of res.landmarks || []) {
+        du.drawConnectors(lms, PoseLandmarker.POSE_CONNECTIONS, { color: COLORS.green, lineWidth: 4 });
+        du.drawLandmarks(lms, { color: COLORS.cyan, fillColor: "#0b6b78", lineWidth: 1, radius: 4 });
+      }
+    } else if (mode === "hand") {
+      const hands = res.landmarks || [];
+      for (let i = 0; i < hands.length; i++) {
+        const label = res.handedness && res.handedness[i] && res.handedness[i][0]
+          ? res.handedness[i][0].categoryName : "";
+        const c = label === "Left" ? COLORS.cyan : COLORS.magenta;
+        du.drawConnectors(hands[i], HandLandmarker.HAND_CONNECTIONS, { color: c, lineWidth: 4 });
+        du.drawLandmarks(hands[i], { color: COLORS.white, fillColor: c, lineWidth: 1, radius: 4 });
+      }
+    } else if (mode === "face") {
+      for (const lms of res.faceLandmarks || []) drawFaceMesh(lms, FaceLandmarker);
+    } else { // holistic: 全身＋両手＋顔を同時。各フィールドはネスト配列([][])なので [0] を取り出す
+      drawFaceMesh(res.faceLandmarks && res.faceLandmarks[0], HolisticLandmarker);
+      const pose = res.poseLandmarks && res.poseLandmarks[0];
+      if (pose) {
+        du.drawConnectors(pose, HolisticLandmarker.POSE_CONNECTIONS, { color: COLORS.green, lineWidth: 3 });
+        du.drawLandmarks(pose, { color: COLORS.cyan, fillColor: "#0b6b78", lineWidth: 1, radius: 3 });
+      }
+      const lh = res.leftHandLandmarks && res.leftHandLandmarks[0];
+      if (lh) {
+        du.drawConnectors(lh, HolisticLandmarker.HAND_CONNECTIONS, { color: COLORS.cyan, lineWidth: 3 });
+        du.drawLandmarks(lh, { color: COLORS.white, fillColor: COLORS.cyan, lineWidth: 1, radius: 3 });
+      }
+      const rh = res.rightHandLandmarks && res.rightHandLandmarks[0];
+      if (rh) {
+        du.drawConnectors(rh, HolisticLandmarker.HAND_CONNECTIONS, { color: COLORS.magenta, lineWidth: 3 });
+        du.drawLandmarks(rh, { color: COLORS.white, fillColor: COLORS.magenta, lineWidth: 1, radius: 3 });
+      }
+    }
+  }
+
+  // ===== 軌跡エフェクト =====
+  function pushTrail(res, now) {
+    if (!settings.trail || !res) return;
+    const pts = [];
+    if (mode === "pose") {
+      const L = res.landmarks && res.landmarks[0];
+      if (L) {
+        if (L[15]) pts.push([L[15], COLORS.cyan]);    // 左手首
+        if (L[16]) pts.push([L[16], COLORS.magenta]); // 右手首
+      }
+    } else if (mode === "hand") {
+      const tips = [4, 8, 12, 16, 20]; // 指先
+      const hands = res.landmarks || [];
+      for (let i = 0; i < hands.length; i++) {
+        const label = res.handedness && res.handedness[i] && res.handedness[i][0]
+          ? res.handedness[i][0].categoryName : "";
+        const c = label === "Left" ? COLORS.cyan : COLORS.magenta;
+        for (const t of tips) if (hands[i][t]) pts.push([hands[i][t], c]);
+      }
+    } else if (mode === "holistic") {
+      const tips = [4, 8, 12, 16, 20]; // 指先（左右の手）
+      const lh = res.leftHandLandmarks && res.leftHandLandmarks[0];
+      const rh = res.rightHandLandmarks && res.rightHandLandmarks[0];
+      if (lh) for (const t of tips) if (lh[t]) pts.push([lh[t], COLORS.cyan]);
+      if (rh) for (const t of tips) if (rh[t]) pts.push([rh[t], COLORS.magenta]);
+    }
+    for (const [p, c] of pts) trail.push({ x: p.x, y: p.y, t: now, c });
+    if (trail.length > 2000) trail = trail.filter((p) => now - p.t < TRAIL_LIFE);
+  }
+
+  function drawTrail(now, w, h) {
+    if (!settings.trail || trail.length === 0) return;
+    const cutoff = now - TRAIL_LIFE;
+    let i = 0;
+    while (i < trail.length && trail[i].t < cutoff) i++;
+    if (i > 0) trail.splice(0, i);
+
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    for (const p of trail) {
+      const a = Math.max(0, 1 - (now - p.t) / TRAIL_LIFE);
+      ctx.beginPath();
+      ctx.fillStyle = hexToRgba(p.c, a * 0.6);
+      ctx.arc(p.x * w, p.y * h, 2 + 11 * a, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  // ===== HUD更新 =====
+  function updateFps(now) {
+    fpsFrames++;
+    if (now - fpsT0 >= 500) {
+      const v = Math.round((fpsFrames * 1000) / (now - fpsT0));
+      fpsEl.textContent = v;
+      fps2El.textContent = v;
+      fpsT0 = now;
+      fpsFrames = 0;
+    }
+  }
+
+  function updateCount(res) {
+    let n = 0;
+    if (res) {
+      if (mode === "face") {
+        n = (res.faceLandmarks || []).length;
+      } else if (mode === "holistic") {
+        // 検出できたパーツ数（全身/左手/右手/顔 のうちいくつ＝最大4）
+        n = [res.poseLandmarks, res.leftHandLandmarks, res.rightHandLandmarks, res.faceLandmarks]
+          .filter((a) => a && a.length).length;
+      } else {
+        n = (res.landmarks || []).length;
+      }
+    }
+    countEl.textContent = n;
+    count2El.textContent = n;
+  }
+
+  // ===== モード切替 =====
+  async function setMode(m) {
+    if (m === mode) return;
+    mode = m;
+    [...modeSeg.children].forEach((b) => b.classList.toggle("active", b.dataset.mode === m));
+    modeHintEl.textContent = HINTS[m];
+    countLabelEl.textContent = COUNT_LABELS[m];
+    lastResult = null;
+    trail = [];
+    updateCount(null);
+    if (running) {
+      setStatus("loading", "モデルを読み込み中…");
+      try {
+        await getLandmarker(m);
+        // 読込中に停止／再度モード変更された場合は、状態表示を上書きしない
+        if (running && mode === m) setStatus("hide");
+      } catch (e) {
+        if (running && mode === m) setStatus("error", "モデルの読み込みに失敗しました", String(e && e.message || e));
+      }
+    }
+  }
+
+  // ===== トグル =====
+  function bindToggle(el, key, onChange) {
+    const apply = () => {
+      const on = !(el.getAttribute("aria-pressed") === "true");
+      el.setAttribute("aria-pressed", String(on));
+      settings[key] = on;
+      if (onChange) onChange(on);
+    };
+    el.addEventListener("click", apply);
+    el.addEventListener("keydown", (e) => { if (e.key === " " || e.key === "Enter") { e.preventDefault(); apply(); } });
+  }
+
+  // ===== イベント =====
+  toggleCamBtn.addEventListener("click", () => (running ? stop() : start()));
+  modeSeg.addEventListener("click", (e) => {
+    const btn = e.target.closest("button[data-mode]");
+    if (btn) setMode(btn.dataset.mode);
+  });
+  bindToggle(tglMirror, "mirror");
+  bindToggle(tglVideo, "showVideo");
+  bindToggle(tglTrail, "trail", (on) => { if (!on) trail = []; });
+
+  snapBtn.addEventListener("click", () => {
+    if (!running) return;
+    const a = document.createElement("a");
+    a.download = "motion-" + new Date().toISOString().replace(/[:.]/g, "-") + ".png";
+    a.href = canvas.toDataURL("image/png");
+    a.click();
+  });
+
+  // ===== 初期化 =====
+  modeHintEl.textContent = HINTS[mode];
+  countLabelEl.textContent = COUNT_LABELS[mode];
+  paintIdleBackground();
+
+  // セキュアコンテキスト警告（file:// などで開いた場合）
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    insecureEl.style.display = "block";
+    insecureEl.innerHTML = location.protocol === "file:"
+      ? "⚠️ <b>file:// では動作しません。</b>ターミナルでこのフォルダに移動し <code>python3 -m http.server 8000</code> を実行、<code>http://localhost:8000</code> を開いてください。"
+      : "⚠️ このコンテキストではカメラを使用できません。<code>http://localhost</code> または <code>https://</code> で開いてください。";
+    toggleCamBtn.disabled = true;
+  }
+</script>
