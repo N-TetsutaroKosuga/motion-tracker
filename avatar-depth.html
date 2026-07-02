@@ -172,6 +172,7 @@
       <div style="display:flex; flex-direction:column; gap:8px; margin-top:8px">
         <div class="toggle" id="tglPip" aria-pressed="true" role="button" tabindex="0"><span>カメラ映像を表示</span><span class="sw"></span></div>
         <div class="toggle" id="tglDepth" aria-pressed="false" role="button" tabindex="0"><span id="depthToggleLabel">奥行きAI（深度推定・前後）</span><span class="sw"></span></div>
+        <div class="toggle" id="tglHandAnchor" aria-pressed="true" role="button" tabindex="0" title="前方リーチ時、腕でなく手を頼りに肘・手首のzを復元（ハイブリッド方式時のみ）"><span>✋ 手アンカー（前方リーチ強化）</span><span class="sw"></span></div>
         <div class="slider">
           <div class="head"><span>なめらかさ</span><span id="smoothVal">0.30</span></div>
           <input type="range" id="smooth" min="0.1" max="0.6" step="0.05" value="0.3" />
@@ -248,6 +249,7 @@
   const depthDbgCtx = depthDbg.getContext("2d");
   const zMethodBtns = [...document.querySelectorAll("[data-zmethod]")];
   const calBtn = document.getElementById("calBtn");
+  const tglHandAnchor = document.getElementById("tglHandAnchor");
 
   // ===== 状態 =====
   let currentVrm = null;
@@ -257,7 +259,7 @@
   let starting = false;
   let simResult = null; // シミュレーション中はこの合成結果を使う（カメラ不要）
   let SMOOTH = 0.3;
-  let WRIST_MODE = "natural"; // "natural"=手首は前腕に追従 / "track"=Kalidokitの手首向きを適用
+  let WRIST_MODE = "auto"; // "natural"=常に前腕追従 / "track"=常にKalidokitの手首向きを適用 / "auto"=手が大きく映っている時だけ適用（ハイブリッド既定）
   window.__setWristMode = (m) => { WRIST_MODE = m; };
   let isVRM0 = false; // VRM0はrotateVRM0で180°回転するため腕の仰角(z)の符号が逆になる
   let DEPTH_REACH = true; // 前後(矢状面)近似トラッキングのON/OFF
@@ -310,8 +312,39 @@
   window.__setFlipGate = (v) => { HZ.FLIP_ZMAG_THRESH = v; };
   window.__setSagLimits = (deadzone, maxRate) => { HZ.SAG_DEADZONE = deadzone; HZ.SAG_MAX_RATE = maxRate; };
 
+  // ---- 手アンカー方式（前方リーチ強化）: 数値定数 ----
+  // 前方リーチで腕の2D投影が点に潰れ zMag が骨長飽和する問題への対策。
+  // 「手」は前方リーチ時に最も大きく鮮明に映る部位＝見かけサイズから手首距離を復元し、
+  // 肩-手首の3D位置+骨長から肘を2ボーンIKで閉形式復元する（肘ランドマークが不要になる）。
+  const HA = {
+    HFOV_DEG: 60,          // 典型的Webカメラの水平画角[deg]（較正のD0算出に使用。実機に応じて__setHfovで調整可）
+    RHO_LO: 0.35, RHO_HI: 0.65, // ブレンド重みwのsmoothstep区間（リーチ度ρ）
+    CAL_RHO_MAX: 0.2,      // 自動較正フォールバック採用条件：ρがこれ未満＝腕がほぼ画面平行（Tポーズ相当）
+    WRIST_ROT_RATIO: 1.15, // rがこれを超えたら手首回転(Kalidokit)を有効化
+    HAND_MATCH_THRESH: 0.15, // 手首点(hand[0])とポーズ2D手首の最近傍マッチング閾値（正規化距離）
+    DZ_MIN: -0.15,         // Δzクランプ下限[m]
+    DZ_MAX_MARGIN: 0.1,    // Δzクランプ上限 = L_ua+L_fa+DZ_MAX_MARGIN[m]
+    W_TAU: 0.15,           // ブレンド重みw・手首回転強度のexpLerp時定数[s]（ポップ防止）
+    SWIVEL_TAU: 0.3,       // 肘スイベル方向のスローEMA時定数[s]（急変防止）
+    SWIVEL_OUT: 0.6, SWIVEL_DOWN: 0.8, // 低visibility時の自然姿勢バイアス係数（外側・下方向）
+    ELBOW_VIS_MIN: 0.5,    // このvisibility以上なら観測された肘位置をスイベル方向の根拠に使う
+    D_MAX_RATIO: 0.995,    // 肩-手首距離dのクランプ比率（L_ua+L_faに対して。特異点回避）
+  };
+  let HAND_ANCHOR_ENABLED = true; // 設定パネルのトグル・__setHandAnchorで変更（ハイブリッド時のみ有効）
+  window.__setHandAnchor = (on) => {
+    HAND_ANCHOR_ENABLED = !!on;
+    if (tglHandAnchor) tglHandAnchor.setAttribute("aria-pressed", String(HAND_ANCHOR_ENABLED));
+  };
+  window.__setHfov = (deg) => { if (deg > 0) HA.HFOV_DEG = deg; };
+  window.__setHandAnchorParams = (rhoLo, rhoHi, wristRotRatio) => {
+    if (rhoLo != null) HA.RHO_LO = rhoLo;
+    if (rhoHi != null) HA.RHO_HI = rhoHi;
+    if (wristRotRatio != null) HA.WRIST_ROT_RATIO = wristRotRatio;
+  };
+
   // ---- 骨長キャリブレーション ----
-  const CAL_KEY = "avatarDepth.boneCal.v1";
+  const CAL_KEY_V1 = "avatarDepth.boneCal.v1"; // 旧版（骨長のみ）。存在すればL_ua/L_faだけ引き継ぐ
+  const CAL_KEY = "avatarDepth.boneCal.v2";    // 手アンカー分（d09_0/d517_0/W_m/w_n）を追加した現行版
   let L_ua = 0.28, L_fa = 0.25; // 較正前フォールバック値（成人の平均的な上腕/前腕長 相当）
   let calStatus = "default";    // "default" | "auto" | "manual"
   const calBuf = { ua2d: 0, fa2d: 0, uaSamples: [], faSamples: [] };
@@ -321,6 +354,17 @@
   // グリッチで異常に大きい値が一度記録されただけで、以後の正常なサンプルが全てCAL_NEAR_MAX_RATIO判定で
   // 棄却され続け、自動較正が恒久的に停止してしまう。スローに減衰させることで数十秒~数分オーダーで回復させる。
   const CAL_MAX_DECAY = 0.999;
+
+  // ---- 手アンカー方式：較正状態 ----
+  // d09_0/d517_0は左右別（キーは15=left/16=right、腕チェーンと同じ規約）。W_m/w_nは肩幅の較正値（左右共通）。
+  // D0はW_m/w_nとHA.HFOV_DEGから毎回その場で導出する（__setHfovで実行時調整した際に即座に反映されるように、
+  // 較正時の値をD0として固定保存しない）。
+  let handCal = { d09_0: { 15: null, 16: null }, d517_0: { 15: null, 16: null }, W_m: null, w_n: null };
+  let handCalStatus = "default"; // "default" | "auto" | "manual"（明示較正済みなら自動更新しない）
+  const handCalBuf = {
+    d09Samples: { 15: [], 16: [] }, d517Samples: { 15: [], 16: [] },
+    wmSamples: [], wnSamples: [],
+  };
 
   // ---- ハイブリッドZ: 実行時状態 ----
   const shoulderZRef = {};   // idx(11,12) -> 低域通過済み基準z
@@ -396,10 +440,25 @@
 
   // 明示キャリブレーション（Tポーズ3秒収集）
   let manualCalActive = false, manualCalT0 = 0, manualCalUA = [], manualCalFA = [];
+  const manualCalD09 = { 15: [], 16: [] }, manualCalD517 = { 15: [], 16: [] };
+  const manualCalWm = [], manualCalWn = [];
   const MANUAL_CAL_MS = 3000;
   try {
-    const saved = JSON.parse(localStorage.getItem(CAL_KEY) || "null");
-    if (saved && saved.L_ua > 0 && saved.L_fa > 0) { L_ua = saved.L_ua; L_fa = saved.L_fa; calStatus = "manual"; }
+    const savedV2 = JSON.parse(localStorage.getItem(CAL_KEY) || "null");
+    if (savedV2 && savedV2.L_ua > 0 && savedV2.L_fa > 0) {
+      L_ua = savedV2.L_ua; L_fa = savedV2.L_fa; calStatus = "manual";
+      const h = savedV2.hand;
+      if (h && h.W_m > 0 && h.w_n > 0) {
+        handCal = { d09_0: { 15: h.d09_0 && h.d09_0[15] > 0 ? h.d09_0[15] : null, 16: h.d09_0 && h.d09_0[16] > 0 ? h.d09_0[16] : null },
+          d517_0: { 15: h.d517_0 && h.d517_0[15] > 0 ? h.d517_0[15] : null, 16: h.d517_0 && h.d517_0[16] > 0 ? h.d517_0[16] : null },
+          W_m: h.W_m, w_n: h.w_n };
+        handCalStatus = "manual";
+      }
+    } else {
+      // v2データが無い場合のみv1（骨長のみ）にフォールバック。手系はv1に存在しないため未較正のまま。
+      const savedV1 = JSON.parse(localStorage.getItem(CAL_KEY_V1) || "null");
+      if (savedV1 && savedV1.L_ua > 0 && savedV1.L_fa > 0) { L_ua = savedV1.L_ua; L_fa = savedV1.L_fa; calStatus = "manual"; }
+    }
   } catch (e) { /* localStorage不可・壊れたデータは無視してデフォルト値を使う */ }
 
   // ===== three.js シーン =====
@@ -500,7 +559,7 @@
   // Kalidokit(親指 Proximal/Intermediate/Distal) → VRM1(thumbMetacarpal/Proximal/Distal)
   const THUMB_MAP = [["ThumbProximal", "ThumbMetacarpal"], ["ThumbIntermediate", "ThumbProximal"], ["ThumbDistal", "ThumbDistal"]];
 
-  function rigHand(vrmSide, h, kaliSide, rp) {
+  function rigHand(vrmSide, h, kaliSide, rp, rotBlend) {
     if (!h) return;
     const Cap = vrmSide === "left" ? "Left" : "Right";
     const wristK = h[kaliSide + "Wrist"];
@@ -508,8 +567,15 @@
       const poseHand = rp ? rp[Cap + "Hand"] : null;
       if (vrmSide === "left") window.__lastHand = { x: wristK.x, y: wristK.y, z: wristK.z, poseZ: poseHand ? poseHand.z : null };
       // 手首は前腕に自然追従（Kalidokitの手首向きは単眼では不安定で“変な捻れ”になるため適用しない）
-      // ※ WRIST_MODE を "track" にすると下行が有効化される（実データ検証用に保持）
-      if (WRIST_MODE === "track") rigRotation(vrmSide + "Hand", { z: poseHand ? poseHand.z : wristK.z, y: wristK.y, x: wristK.x });
+      // ※ WRIST_MODE を "track" にすると常時有効化（実データ検証用に保持）。
+      // "auto"（ハイブリッド既定）は手が大きく映っている間(r>WRIST_ROT_RATIO)だけ、rotBlend(0-1)で
+      // 目標回転量そのものをスケールして適用する＝条件を外れるとrotBlend→0で自然と恒等回転(前腕追従)へ戻る。
+      if (WRIST_MODE === "track") {
+        rigRotation(vrmSide + "Hand", { z: poseHand ? poseHand.z : wristK.z, y: wristK.y, x: wristK.x });
+      } else if (WRIST_MODE === "auto" && rotBlend > 0.001) {
+        const tz = poseHand ? poseHand.z : wristK.z;
+        rigRotation(vrmSide + "Hand", { z: tz * rotBlend, y: wristK.y * rotBlend, x: wristK.x * rotBlend });
+      }
     }
     for (const f of FINGERS) for (const s of SEGS) {
       const k = h[kaliSide + f + s];
@@ -740,15 +806,30 @@
   }
   function startManualCalibration() {
     manualCalActive = true; manualCalT0 = performance.now(); manualCalUA = []; manualCalFA = [];
+    manualCalD09[15] = []; manualCalD09[16] = []; manualCalD517[15] = []; manualCalD517[16] = [];
+    manualCalWm.length = 0; manualCalWn.length = 0;
     if (calBtn) { calBtn.textContent = "📐 収集中… 0%"; calBtn.disabled = true; }
   }
-  function stepManualCalibration(world, now) {
+  function stepManualCalibration(world, lm2, lHand, rHand, vid, now) {
     if (!manualCalActive || !world) return;
     const elapsed = now - manualCalT0;
     for (const [aI, bI, arr] of [[11, 13, manualCalUA], [12, 14, manualCalUA], [13, 15, manualCalFA], [14, 16, manualCalFA]]) {
       if (!visOk(world, aI) || !visOk(world, bI)) continue;
       const l3 = seg3DLenXY(world, aI, bI);
       if (l3 != null) arr.push(l3);
+    }
+    // 手アンカー用較正：Tポーズ中(=腕水平)の手サイズ・肩幅も同時に収集する
+    if (lm2) {
+      const aspect = handAnchorAspect(vid);
+      const match = matchHandsToWrists(lm2, lHand, rHand);
+      for (const side of [15, 16]) {
+        const hand = match[side];
+        const m = handSizeMetrics(hand, aspect);
+        if (m) { manualCalD09[side].push(m.d09); manualCalD517[side].push(m.d517); }
+      }
+      const wn = shoulderWidth2D(lm2, aspect);
+      const wm = seg3DLenXY(world, 11, 12);
+      if (wn != null && wm != null && wm > 0) { manualCalWm.push(wm); manualCalWn.push(wn); }
     }
     if (calBtn) calBtn.textContent = "📐 収集中… " + Math.min(100, Math.round((elapsed / MANUAL_CAL_MS) * 100)) + "%";
     if (elapsed >= MANUAL_CAL_MS) {
@@ -757,9 +838,223 @@
       if (mUa) L_ua = mUa;
       if (mFa) L_fa = mFa;
       calStatus = "manual";
-      try { localStorage.setItem(CAL_KEY, JSON.stringify({ L_ua, L_fa })); } catch (e) { /* 保存不可でも較正結果自体は継続利用 */ }
+      const md09L = median(manualCalD09[15]), md09R = median(manualCalD09[16]);
+      const md517L = median(manualCalD517[15]), md517R = median(manualCalD517[16]);
+      const mWm = median(manualCalWm), mWn = median(manualCalWn);
+      if (md09L) handCal.d09_0[15] = md09L;
+      if (md09R) handCal.d09_0[16] = md09R;
+      if (md517L) handCal.d517_0[15] = md517L;
+      if (md517R) handCal.d517_0[16] = md517R;
+      if (mWm && mWn) { handCal.W_m = mWm; handCal.w_n = mWn; }
+      handCalStatus = "manual";
+      try {
+        localStorage.setItem(CAL_KEY, JSON.stringify({
+          L_ua, L_fa,
+          hand: { d09_0: { 15: handCal.d09_0[15], 16: handCal.d09_0[16] }, d517_0: { 15: handCal.d517_0[15], 16: handCal.d517_0[16] }, W_m: handCal.W_m, w_n: handCal.w_n, D0: currentD0() },
+        }));
+      } catch (e) { /* 保存不可でも較正結果自体は継続利用 */ }
       if (calBtn) { calBtn.textContent = "📐 キャリブレーション（Tポーズ3秒）"; calBtn.disabled = false; }
     }
+  }
+
+  // ---- 手アンカー方式：ヘルパー（手⇔ポーズのマッチング、手サイズ→z、肘2ボーンIK） ----
+  // 幅正規化のための縦横比（videoHeight/videoWidth）。sim等でvideoが無い場合は4:3を仮定。
+  function handAnchorAspect(vid) {
+    return (vid && vid.videoWidth > 0 && vid.videoHeight > 0) ? (vid.videoHeight / vid.videoWidth) : 0.75;
+  }
+  // 幅正規化空間での2D距離（dyにaspectを掛けて縦横比を補正）
+  function widthNormDist(pa, pb, aspect) {
+    if (!pa || !pb) return null;
+    const dx = pa.x - pb.x, dy = (pa.y - pb.y) * aspect;
+    return Math.hypot(dx, dy);
+  }
+  function shoulderWidth2D(lm2, aspect) { return lm2 ? widthNormDist(lm2[11], lm2[12], aspect) : null; }
+  // 手の見かけサイズ：d09=手首→中指MCP、d517=人差し指MCP→小指MCP（幅正規化空間）
+  function handSizeMetrics(hand, aspect) {
+    if (!hand || !hand[0] || !hand[9] || !hand[5] || !hand[17]) return null;
+    const d09 = widthNormDist(hand[0], hand[9], aspect);
+    const d517 = widthNormDist(hand[5], hand[17], aspect);
+    if (d09 == null || d517 == null) return null;
+    return { d09, d517 };
+  }
+  // 手⇔ポーズのマッチング：leftHandLandmarks/rightHandLandmarksのラベルはポーズ左右と入れ替わることが
+  // あるため、既存rigHand呼び出し(入れ替え適用)とは独立に、hand[0]とlm2[15]/lm2[16]の2D距離で
+  // 毎フレーム最近傍マッチングし直す。側("left"=15/"right"=16)→手配列。
+  function matchHandsToWrists(lm2, lHand, rHand) {
+    const cands = [];
+    if (lHand && lHand[0]) cands.push({ hand: lHand, id: "L" });
+    if (rHand && rHand[0]) cands.push({ hand: rHand, id: "R" });
+    const out = { 15: null, 16: null };
+    if (!cands.length || !lm2) return out;
+    const pairs = [];
+    for (const side of [15, 16]) {
+      const p = lm2[side];
+      if (!p) continue;
+      for (const c of cands) {
+        const d = Math.hypot(c.hand[0].x - p.x, c.hand[0].y - p.y);
+        if (d <= HA.HAND_MATCH_THRESH) pairs.push({ side, hand: c.hand, id: c.id, d });
+      }
+    }
+    pairs.sort((a, b) => a.d - b.d);
+    const usedSide = new Set(), usedHand = new Set();
+    for (const p of pairs) {
+      if (usedSide.has(p.side) || usedHand.has(p.id)) continue;
+      out[p.side] = p.hand;
+      usedSide.add(p.side); usedHand.add(p.id);
+    }
+    return out;
+  }
+  // D0はW_m/w_nとHA.HFOV_DEG(実行時調整可)からその場で導出する
+  function currentD0() {
+    if (!(handCal.W_m > 0) || !(handCal.w_n > 0)) return null;
+    const f = 0.5 / Math.tan((HA.HFOV_DEG * Math.PI / 180) / 2);
+    return f * handCal.W_m / handCal.w_n;
+  }
+  // 自動較正フォールバック：腕がほぼ画面平行(ρ<HA.CAL_RHO_MAX)かつ手マッチ成功のフレームで
+  // 手サイズのランニング中央値を蓄積（骨長自動較正と同じ「サンプル配列+中央値」パターン）。
+  // 明示較正済みならここでは更新しない。
+  function updateHandAutoCalSide(side, hand, rho, aspect) {
+    if (handCalStatus === "manual") return;
+    if (!(rho < HA.CAL_RHO_MAX)) return;
+    const m = handSizeMetrics(hand, aspect);
+    if (!m) return;
+    const a09 = handCalBuf.d09Samples[side], a517 = handCalBuf.d517Samples[side];
+    a09.push(m.d09); if (a09.length > CAL_SAMPLE_MAX) a09.shift();
+    a517.push(m.d517); if (a517.length > CAL_SAMPLE_MAX) a517.shift();
+    const md09 = median(a09), md517 = median(a517);
+    if (md09) { handCal.d09_0[side] = md09; if (handCalStatus === "default") handCalStatus = "auto"; }
+    if (md517) { handCal.d517_0[side] = md517; if (handCalStatus === "default") handCalStatus = "auto"; }
+  }
+  function updateHandAutoCalShoulder(world, lm2, aspect, anyRhoLow) {
+    if (handCalStatus === "manual" || !anyRhoLow) return;
+    const wn = shoulderWidth2D(lm2, aspect);
+    const wm = seg3DLenXY(world, 11, 12);
+    if (wn == null || wm == null || wm <= 0) return;
+    handCalBuf.wmSamples.push(wm); if (handCalBuf.wmSamples.length > CAL_SAMPLE_MAX) handCalBuf.wmSamples.shift();
+    handCalBuf.wnSamples.push(wn); if (handCalBuf.wnSamples.length > CAL_SAMPLE_MAX) handCalBuf.wnSamples.shift();
+    const mWm = median(handCalBuf.wmSamples), mWn = median(handCalBuf.wnSamples);
+    if (mWm && mWn) { handCal.W_m = mWm; handCal.w_n = mWn; if (handCalStatus === "default") handCalStatus = "auto"; }
+  }
+  function smoothstep(x, lo, hi) {
+    if (hi <= lo) return x >= hi ? 1 : 0; // ガード（RHO_LO/HIの誤設定で0除算を避ける）
+    const t = clamp((x - lo) / (hi - lo), 0, 1);
+    return t * t * (3 - 2 * t);
+  }
+  // ベクトルvをdir(単位ベクトル)に直交化して正規化。dirとほぼ平行で縮退する場合はnullを返す。
+  function orthonormalize(vec, dir) {
+    const dot = vec.x * dir.x + vec.y * dir.y + vec.z * dir.z;
+    const ox = vec.x - dot * dir.x, oy = vec.y - dot * dir.y, oz = vec.z - dot * dir.z;
+    const len = Math.hypot(ox, oy, oz);
+    if (!(len > 1e-6)) return null;
+    return { x: ox / len, y: oy / len, z: oz / len };
+  }
+  const swivelState = {};       // wrist idx(15,16) -> スイベル方向の単位ベクトル（スローEMA適用後）
+  const wristRotBlend = {};     // wrist idx(15,16) -> 手首回転の適用強度（0-1、expLerpでランプ）
+  let lastHandMatch = { 15: null, 16: null }; // wrist idx -> 直近フレームでマッチした手配列（rigHandの回転ゲート判定用）
+  const HA_DBG = {              // デバッグパネル・__zProbe用に直近値を保持
+    15: { w: 0, r: null, dz: null, elbowDeg: null, matched: false },
+    16: { w: 0, r: null, dz: null, elbowDeg: null, matched: false },
+  };
+  const lastValidAnchor = {};   // wrist idx(15,16) -> 直近の有効な{anchorWristZ, elbowIK, elbowDeg}
+  // ↑手が急に消えたフレームでdzがnullになってもこれを使い続けることで、w(既にquality=falseで
+  // 減衰中)がなだらかに0へ落ちるのに追従してフェードアウトさせる（wと連動した瞬間切り替えを防止）。
+  // 手アンカー方式の本体：肩・手首(・観測された肘)から、手サイズ比rによる手首z推定と
+  // 肘の2ボーンIK復元を行い、従来チェーン値とブレンドした{elbowX,Y,Z, wristZ, w, r, dz, elbowDeg}を返す。
+  // 手が未検出/未較正など復元不能な場合はnullを返し、呼び出し側は従来チェーン値をそのまま使う。
+  function computeHandAnchorSide(shoulder, elbow, wrist, leftSide, hand, rho, aspect, world, lm2, elbowZChain, wristZChain, dt, now) {
+    const matched = !!(hand && hand[0]);
+    const D0 = currentD0();
+    let r = null, dz = null;
+    if (matched && D0 != null) {
+      const m = handSizeMetrics(hand, aspect);
+      const cd09 = handCal.d09_0[wrist], cd517 = handCal.d517_0[wrist];
+      const cands = [];
+      if (m && cd09 > 0) cands.push(m.d09 / cd09);
+      if (m && cd517 > 0) cands.push(m.d517 / cd517);
+      if (cands.length) {
+        r = Math.max(...cands);
+        if (r > 1e-6) {
+          const dzMax = L_ua + L_fa + HA.DZ_MAX_MARGIN;
+          dz = clamp(D0 * (1 - 1 / r), HA.DZ_MIN, dzMax);
+        }
+      }
+    }
+    // 品質ゲート（マッチ成功・r有効・手のvisibility）。手のvisibilityはtasks-visionでは欠損時nullのことが
+    // あるためvisOk相当(null=許可)で判定する。
+    const handVisOk = !matched || hand[0].visibility == null || hand[0].visibility >= HZ.VIS_GATE_MIN;
+    const quality = matched && r != null && dz != null && handVisOk;
+
+    // ---- ブレンド重みw：リーチ度ρのsmoothstep × 手品質。時定数HA.W_TAUのexpLerpでポップ防止 ----
+    const wRaw = quality ? smoothstep(rho, HA.RHO_LO, HA.RHO_HI) : 0;
+    const wPrev = HA_DBG[wrist].w;
+    let w = expLerp(wPrev, wRaw, dt, HA.W_TAU);
+    w = clamp(w, 0, 1); // 自己検証(b): 0<=w<=1 を全経路で保証
+
+    // dz未確定時はアンカー値=チェーン値にしておく（wがまだ減衰しきっていない過渡期でも安全＝ブレンドが恒等になる）
+    let elbowX = world[elbow].x, elbowY = world[elbow].y, elbowZ = elbowZChain, wristZ = wristZChain, elbowDeg = null;
+
+    if (dz != null) {
+      const anchorWristZ = shoulderZRef[shoulder] - dz; // MediaPipe world: -zがカメラ手前
+      const S = { x: world[shoulder].x, y: world[shoulder].y, z: shoulderZRef[shoulder] };
+      const W = { x: world[wrist].x, y: world[wrist].y, z: anchorWristZ };
+      const dxIK = W.x - S.x, dyIK = W.y - S.y, dzIK = W.z - S.z;
+      const dRaw = Math.hypot(dxIK, dyIK, dzIK);
+      if (dRaw > 1e-6) {
+        const dir = { x: dxIK / dRaw, y: dyIK / dRaw, z: dzIK / dRaw }; // 方向は生の差ベクトルから正規化（クランプ前）
+        const dMax = HA.D_MAX_RATIO * (L_ua + L_fa);
+        const d = Math.min(dRaw, dMax); // 自己検証(c): 特異点(d=0 or d>L_ua+L_fa)回避のクランプ
+        const a = (L_ua * L_ua - L_fa * L_fa + d * d) / (2 * d);
+        const rc = Math.sqrt(Math.max(0, L_ua * L_ua - a * a)); // 自己検証(c): sqrtガード
+
+        // スイベル方向：肘のvisibilityが高ければ観測位置、低ければ自然姿勢バイアス（下+外側）
+        let swivelRaw = null;
+        if (visOk(world, elbow, HA.ELBOW_VIS_MIN)) {
+          const diff = { x: world[elbow].x - S.x, y: world[elbow].y - S.y, z: world[elbow].z - S.z };
+          swivelRaw = orthonormalize(diff, dir);
+        }
+        if (!swivelRaw) {
+          const ox = leftSide ? 1 : -1;
+          swivelRaw = orthonormalize({ x: HA.SWIVEL_OUT * ox, y: HA.SWIVEL_DOWN, z: 0 }, dir);
+        }
+        if (!swivelRaw) swivelRaw = { x: 0, y: 1, z: 0 }; // dirがほぼ真下等、最終縮退時のフォールバック
+
+        let sw = swivelState[wrist];
+        if (!sw) sw = swivelRaw;
+        else {
+          sw = {
+            x: expLerp(sw.x, swivelRaw.x, dt, HA.SWIVEL_TAU),
+            y: expLerp(sw.y, swivelRaw.y, dt, HA.SWIVEL_TAU),
+            z: expLerp(sw.z, swivelRaw.z, dt, HA.SWIVEL_TAU),
+          };
+          const len = Math.hypot(sw.x, sw.y, sw.z);
+          sw = (len > 1e-6) ? { x: sw.x / len, y: sw.y / len, z: sw.z / len } : swivelRaw;
+        }
+        swivelState[wrist] = sw;
+
+        const elbowIK = { x: S.x + a * dir.x + rc * sw.x, y: S.y + a * dir.y + rc * sw.y, z: S.z + a * dir.z + rc * sw.z };
+        const cosDeg = clamp((L_ua * L_ua + L_fa * L_fa - d * d) / (2 * Math.max(1e-6, L_ua * L_fa)), -1, 1);
+        elbowDeg = Math.acos(cosDeg) * 180 / Math.PI;
+        lastValidAnchor[wrist] = { anchorWristZ, elbowIK, elbowDeg }; // フェードアウト用に直近有効値を保持
+      }
+    }
+    // 今フレームdzが無効(手が消えた等)でも、直近の有効値があればそれで従来チェーン値とブレンドを続ける。
+    // wはquality=falseの間smoothstep=0へ向けてexpLerpで減衰済みのため、これにより「瞬時切替」ではなく
+    // なめらかなフェードアウトになる（自己検証: 手を隠した際にポップしない）。
+    const cached = lastValidAnchor[wrist];
+    if (cached) {
+      elbowX = lerp(world[elbow].x, cached.elbowIK.x, w);
+      elbowY = lerp(world[elbow].y, cached.elbowIK.y, w);
+      elbowZ = lerp(elbowZChain, cached.elbowIK.z, w);
+      wristZ = lerp(wristZChain, cached.anchorWristZ, w);
+      elbowDeg = cached.elbowDeg;
+    }
+
+    // 手首回転ゲート（E）：r>WRIST_ROT_RATIO かつマッチ成功時のみ、適用強度をwと同じ時定数でランプ
+    const rotTarget = (quality && r != null && r > HA.WRIST_ROT_RATIO) ? 1 : 0;
+    wristRotBlend[wrist] = clamp(expLerp(wristRotBlend[wrist] ?? 0, rotTarget, dt, HA.W_TAU), 0, 1);
+
+    HA_DBG[wrist] = { w, r, dz, elbowDeg, matched };
+    return { elbowX, elbowY, elbowZ, wristZ, w, r, dz, elbowDeg, matched };
   }
 
   // ---- 時定数ベースの指数ローパス（フレームレート非依存） ----
@@ -819,11 +1114,24 @@
     lastFusedZ[idx] = filtered;
     world[idx].z = filtered;
   }
+  // 手アンカー(肘x,y)専用：任意軸をゲート付き+One Euroで書き込む。キーは"13x"のように軸文字を付与し、
+  // 既存のz用フィルタ(idx単体キー)とは独立させる。
+  const lastFusedAxis = {}; // key "<idx><axis>" -> 直近の出力値（visibilityゲート保持・One Euro適用後）
+  function gatedFuseAxis(world, idx, axis, candidateValue, now) {
+    const vis = world[idx] ? world[idx].visibility : null;
+    const gated = !visGateDisabled && vis != null && vis < HZ.VIS_GATE_MIN;
+    const key = String(idx) + axis;
+    if (gated && lastFusedAxis[key] != null) { world[idx][axis] = lastFusedAxis[key]; return; }
+    const filtered = oneEuro(key, candidateValue, now);
+    lastFusedAxis[key] = filtered;
+    world[idx][axis] = filtered;
+  }
 
   // ===== ハイブリッドZ：骨長短縮(foreshortening)で大きさ、深度/生zの符号で前後を決める =====
   // 肩→肘→手首の順に、肩zの低域通過値を基準としてzMagを符号付きで積み上げる（連鎖）。
   // 深度AIが無くても(L_ua/L_faの初期値により)必ず動作する＝符号のみフォールバックに依存。
-  function fuseArmZHybrid(world, lm2, now) {
+  // 手アンカー方式（前方リーチ強化）が有効な場合はここに統合し、単一書き込み原則を維持する。
+  function fuseArmZHybrid(world, lm2, now, lHand, rHand) {
     if (!world[11] || !world[12] || !world[13] || !world[14] || !world[15] || !world[16]) return;
     const dt = lastFuseT == null ? 1 / 60 : clampDt((now - lastFuseT) / 1000);
     lastFuseT = now;
@@ -836,33 +1144,65 @@
     for (const i of [11, 12, 13, 14, 15, 16]) rawZSnapshot[i] = world[i].z;
     for (const i of [11, 12, 13, 14, 15, 16]) rawZLP[i] = expLerp(rawZLP[i], rawZSnapshot[i], dt, HZ.RAWZ_LP_TAU);
 
+    // 手アンカー：有効なのはハイブリッド方式かつトグルONの時のみ（自己検証(a)(d)）。
+    const haOn = HAND_ANCHOR_ENABLED && Z_METHOD === "hybrid";
+    let handMatch = { 15: null, 16: null };
+    if (haOn) handMatch = matchHandsToWrists(lm2, lHand, rHand);
+
+    // 両腕のリーチ度ρを先に求める（自動較正フォールバックの判定・肩幅サンプリングに両腕分必要なため）
+    const geom = {};
     for (const [shoulder, elbow, wrist] of [[11, 13, 15], [12, 14, 16]]) {
+      const dxE = world[elbow].x - world[shoulder].x, dyE = world[elbow].y - world[shoulder].y;
+      const dxW = world[wrist].x - world[elbow].x, dyW = world[wrist].y - world[elbow].y;
+      const lE = Math.hypot(dxE, dyE), lW = Math.hypot(dxW, dyW);
+      geom[wrist] = { lE, lW, rho: 1 - (lE + lW) / Math.max(1e-6, L_ua + L_fa) };
+    }
+    if (haOn) {
+      const aspect = handAnchorAspect(video);
+      for (const side of [15, 16]) updateHandAutoCalSide(side, handMatch[side], geom[side].rho, aspect);
+      updateHandAutoCalShoulder(world, lm2, aspect, geom[15].rho < HA.CAL_RHO_MAX || geom[16].rho < HA.CAL_RHO_MAX);
+    } else {
+      // 手アンカー無効/legacy相当時はデバッグ表示と回転ゲートを中立化する
+      for (const side of [15, 16]) { HA_DBG[side] = { w: 0, r: null, dz: null, elbowDeg: null, matched: false }; wristRotBlend[side] = 0; swivelState[side] = null; lastValidAnchor[side] = null; }
+    }
+
+    for (const [shoulder, elbow, wrist, leftSide] of [[11, 13, 15, true], [12, 14, 16, false]]) {
       shoulderZRef[shoulder] = expLerp(shoulderZRef[shoulder] ?? rawZSnapshot[shoulder], rawZSnapshot[shoulder], dt, HZ.SHOULDER_Z_TAU);
 
-      const dxE = world[elbow].x - world[shoulder].x, dyE = world[elbow].y - world[shoulder].y;
-      const lE = Math.hypot(dxE, dyE);
+      const { lE, lW, rho } = geom[wrist];
       const zMagE = lE >= L_ua ? 0 : Math.sqrt(Math.max(0, L_ua * L_ua - lE * lE));
       const signE = resolveSign(elbow, zMagE);
-      const elbowZ = shoulderZRef[shoulder] - signE * zMagE;
+      const elbowZChain = shoulderZRef[shoulder] - signE * zMagE;
 
-      const dxW = world[wrist].x - world[elbow].x, dyW = world[wrist].y - world[elbow].y;
-      const lW = Math.hypot(dxW, dyW);
       const zMagW = lW >= L_fa ? 0 : Math.sqrt(Math.max(0, L_fa * L_fa - lW * lW));
       const signW = resolveSign(wrist, zMagW);
-      const wristZ = elbowZ - signW * zMagW;
+      const wristZChain = elbowZChain - signW * zMagW;
+
+      let elbowX = world[elbow].x, elbowY = world[elbow].y, elbowZ = elbowZChain, wristZ = wristZChain;
+      if (haOn) {
+        const aspect = handAnchorAspect(video);
+        const res = computeHandAnchorSide(shoulder, elbow, wrist, leftSide, handMatch[wrist], rho, aspect, world, lm2, elbowZChain, wristZChain, dt, now);
+        elbowX = res.elbowX; elbowY = res.elbowY; elbowZ = res.elbowZ; wristZ = res.wristZ;
+      }
 
       gatedFuseWrite(world, shoulder, shoulderZRef[shoulder], now);
+      // 肘x,yのOne Euroは手アンカー有効時のみ適用（無効時は既存挙動通りMediaPipe生値のまま変更しない）
+      if (haOn) { gatedFuseAxis(world, elbow, "x", elbowX, now); gatedFuseAxis(world, elbow, "y", elbowY, now); }
       gatedFuseWrite(world, elbow, elbowZ, now);
       gatedFuseWrite(world, wrist, wristZ, now);
     }
+    lastHandMatch = handMatch; // rigHandの手首回転ゲート判定用（同一フレーム内の参照比較で使う）
   }
   // z注入の一元化：zの書き換えはこの関数のみが行う（複数施策の二重上書きによる切り分け不能を防ぐ）
-  function fuseArmZ(world, lm2, now) {
+  function fuseArmZ(world, lm2, now, lHand, rHand) {
     if (Z_METHOD === "legacy") {
       if (depthEnabled && latestDepth) legacyInjectDepthZ(world, lm2, latestDepth);
+      // 手アンカーはlegacy方式では一切作動しない（自己検証(d)）：状態を中立化する
+      lastHandMatch = { 15: null, 16: null };
+      for (const side of [15, 16]) { HA_DBG[side] = { w: 0, r: null, dz: null, elbowDeg: null, matched: false }; wristRotBlend[side] = 0; swivelState[side] = null; lastValidAnchor[side] = null; }
       return;
     }
-    fuseArmZHybrid(world, lm2, now);
+    fuseArmZHybrid(world, lm2, now, lHand, rHand);
   }
   // ヘッドレス検証用：左右の肘・手首のfused zと符号状態・L較正値を返す
   window.__zProbe = () => {
@@ -873,6 +1213,11 @@
       scaleFit: { a: scaleFit.a, b: scaleFit.b },
       left: { elbowZ: w && w[13] ? w[13].z : null, wristZ: w && w[15] ? w[15].z : null, signElbow: signState[13].sign, signWrist: signState[15].sign },
       right: { elbowZ: w && w[14] ? w[14].z : null, wristZ: w && w[16] ? w[16].z : null, signElbow: signState[14].sign, signWrist: signState[16].sign },
+      handAnchor: {
+        left: { w: HA_DBG[15].w, r: HA_DBG[15].r, dz: HA_DBG[15].dz, elbowDeg: HA_DBG[15].elbowDeg },
+        right: { w: HA_DBG[16].w, r: HA_DBG[16].r, dz: HA_DBG[16].dz, elbowDeg: HA_DBG[16].elbowDeg },
+        D0: currentD0(),
+      },
     };
   };
 
@@ -921,9 +1266,9 @@
       pushPoseRing(performance.now(), pose2d); // レイテンシ補償用リングバッファ（深度推論の有無に関わらず維持）
       const src3d = (pose3dRaw && pose3dRaw.length >= 33) ? pose3dRaw : pose2d;
       const hasWorld = !!(pose3dRaw && pose3dRaw.length >= 33);
-      if (manualCalActive && hasWorld) stepManualCalibration(pose3dRaw, performance.now());
-      // z注入はfuseArmZに一元化（従来=深度直接方式 / ハイブリッド=骨長幾何+符号+One Euro）
-      if (hasWorld) fuseArmZ(src3d, pose2d, performance.now());
+      if (manualCalActive && hasWorld) stepManualCalibration(pose3dRaw, pose2d, lHand, rHand, vid, performance.now());
+      // z注入はfuseArmZに一元化（従来=深度直接方式 / ハイブリッド=骨長幾何+符号+One Euro+手アンカー）
+      if (hasWorld) fuseArmZ(src3d, pose2d, performance.now(), lHand, rHand);
       lastFusedWorld = hasWorld ? src3d : null;
       const solveOpts = { runtime: "mediapipe", enableLegs: true };
       if (vid && vid.videoWidth > 0) solveOpts.video = vid; else solveOpts.imageSize = { width: 480, height: 360 };
@@ -963,7 +1308,10 @@
           "L_ua=" + L_ua.toFixed(3) + " L_fa=" + L_fa.toFixed(3) + " cal=" + calStatus + "\n" +
           "sign L(elbow/wrist)=" + signState[13].sign + "/" + signState[15].sign + " R=" + signState[14].sign + "/" + signState[16].sign + "\n" +
           "scaleFit a=" + scaleFit.a.toFixed(3) + " b=" + scaleFit.b.toFixed(1) + "\n" +
-          "vis(11-16)=" + [11, 12, 13, 14, 15, 16].map(vis).join(",") + (visGateDisabled ? " [gate無効]" : "");
+          "vis(11-16)=" + [11, 12, 13, 14, 15, 16].map(vis).join(",") + (visGateDisabled ? " [gate無効]" : "") + "\n" +
+          "✋手ｱﾝｶｰ=" + (HAND_ANCHOR_ENABLED ? "ON" : "OFF") + " D0=" + f(currentD0()) + " cal=" + handCalStatus + "\n" +
+          "  L w=" + f(HA_DBG[15].w) + " r=" + f(HA_DBG[15].r) + " Δz=" + f(HA_DBG[15].dz) + " elbow°=" + (HA_DBG[15].elbowDeg == null ? "?" : Math.round(HA_DBG[15].elbowDeg)) + " match=" + (HA_DBG[15].matched ? "○" : "×") + "\n" +
+          "  R w=" + f(HA_DBG[16].w) + " r=" + f(HA_DBG[16].r) + " Δz=" + f(HA_DBG[16].dz) + " elbow°=" + (HA_DBG[16].elbowDeg == null ? "?" : Math.round(HA_DBG[16].elbowDeg)) + " match=" + (HA_DBG[16].matched ? "○" : "×");
       }
       if (rp) {
         rigRotation("hips", rp.Hips.rotation, 0.7);
@@ -983,8 +1331,12 @@
 
     // 手：MediaPipe Holistic の左右ハンドはポーズ(腕)の左右と逆ラベルになるため、
     // 指が「動いた腕と同じ側」に出るよう入れ替える（公式Kalidokitデモと同じ手当て）。
-    if (lHand) rigHand("right", Kalidokit.Hand.solve(lHand, "Right"), "Right", rp);
-    if (rHand) rigHand("left", Kalidokit.Hand.solve(rHand, "Left"), "Left", rp);
+    // 手首回転(WRIST_MODE="auto")のゲートは、rigHand呼び出しの入れ替えとは独立に、手アンカー用の
+    // マッチング結果(lastHandMatch: ポーズ手首15/16 -> 手配列)を参照比較して該当side分を渡す。
+    const rotBlendL = (lastHandMatch[15] === lHand) ? wristRotBlend[15] : (lastHandMatch[16] === lHand) ? wristRotBlend[16] : 0;
+    const rotBlendR = (lastHandMatch[15] === rHand) ? wristRotBlend[15] : (lastHandMatch[16] === rHand) ? wristRotBlend[16] : 0;
+    if (lHand) rigHand("right", Kalidokit.Hand.solve(lHand, "Right"), "Right", rp, rotBlendL);
+    if (rHand) rigHand("left", Kalidokit.Hand.solve(rHand, "Left"), "Left", rp, rotBlendR);
 
     // 追跡パーツ数を表示
     partsEl.textContent = [pose2d, lHand, rHand, face].filter((a) => a).length;
@@ -1165,6 +1517,17 @@
     return base;
   }
   window.__simHand = (dir) => { simResult = buildHandTest(dir); };
+  // 手アンカー検証用: 前方リーチ(reachDeg)にfwd向きの左手(スケール0.12*handScale)を付与した合成結果を
+  // 作り、simResultにセットして返す。マッチングはポーズ手首との2D最近傍で行われるためlabelはどちらでも
+  // 動作するが、rigHand互換のためleftHandLandmarksに格納する。
+  window.__simReachHand = (reachDeg, handScale) => {
+    const base = buildPoseReach(reachDeg);
+    const lw = base.poseLandmarks[0][15];
+    const f = { x: 0, y: 0, z: -1 }, s = { x: -1, y: 0, z: 0 }; // buildHandTestの"fwd"プリセットと同一の向き
+    base.leftHandLandmarks = [makeHand({ x: lw.x, y: lw.y, z: 0 }, f, s, 0.12 * (handScale || 1))];
+    simResult = base;
+    return base;
+  };
   // 上腕の向き(world)を数値取得。前方リーチなら z<0（カメラ方向 -Z）になるはず
   window.__armProbe = () => {
     if (!currentVrm) return null;
@@ -1288,6 +1651,7 @@
     el.addEventListener("keydown", (e) => { if (e.key === " " || e.key === "Enter") { e.preventDefault(); apply(); } });
   }
   bindToggle(tglPip, (on) => { pip.classList.toggle("hidden", !on); });
+  bindToggle(tglHandAnchor, (on) => { HAND_ANCHOR_ENABLED = on; });
   document.querySelectorAll("[data-sim]").forEach((b) => b.addEventListener("click", () => setSim(b.dataset.sim)));
   async function toggleDepth() {
     const on = tglDepth.getAttribute("aria-pressed") !== "true";
