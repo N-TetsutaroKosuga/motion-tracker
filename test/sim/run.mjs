@@ -229,33 +229,62 @@ async function missingHooks(page, names) {
 }
 
 /**
- * __zProbe() を100ms間隔でポーリングし、左右のelbowZが2回連続で<0.002しか
- * 変化しなくなるまで待つ(上限3秒)。CONTRACT.md ストリーム2節の収束待ち仕様どおり。
+ * 汎用収束待ちヘルパー(g1タスクで一本化)。__zProbe/__armProbe/__boneWorldProbeの数値を
+ * 200ms間隔でポーリングし、2回連続で全フィールドの変化が<0.01になるまで待つ(上限8秒)。
+ *
+ * 旧実装は__zProbe().{left,right}.elbowZのみを100ms間隔・上限3秒・閾値0.002で監視していたが、
+ * これだと「fuseArmZの融合済みzはOne Euroフィルタでdt基準に収束していても、rigRotationの
+ * quaternion.slerp(target, SMOOTH)はフレーム数ベースの固定ブレンド率(dt非依存)で収束するため、
+ * headless低fps環境(高負荷時)では同じ壁時計3秒でも消化できるフレーム数が減り、__armProbeが
+ * 実際のVRMボーン回転として収束しきる前にサンプリングしてしまう」という時間依存の脆弱性があった。
+ * 実測(2026-07-03、高負荷下でのnew-cross-40): crossArm.left.xが旧実装の+0.22のまま(=収束途中の
+ * 値)でFAILする再現を確認済み。__armProbe/__boneWorldProbeも収束条件に含めることで、
+ * armProbe系アサーションを持つ全ケース(cross-40含む)がこの脆弱性から解放される。
+ *
+ * 返り値: { z, arm, bw, converged, elapsedMs }。zは__zProbe()の生値(従来のprobeフィールド相当)、
+ * armは__armProbe()、bwは__boneWorldProbe()の最終サンプル。
  */
-async function pollUntilStable(page, { maxMs = 3000, intervalMs = 100, epsilon = 0.002, stableStreak = 2 } = {}) {
+async function pollConverge(page, { maxMs = 8000, intervalMs = 200, epsilon = 0.01, stableStreak = 2 } = {}) {
+  const extract = () => {
+    const z = typeof window.__zProbe === "function" ? window.__zProbe() : null;
+    const a = typeof window.__armProbe === "function" ? window.__armProbe() : null;
+    const bw = typeof window.__boneWorldProbe === "function" ? window.__boneWorldProbe() : null;
+    const flat = [];
+    if (z) for (const s of ["left", "right"]) { const d = z[s] || {}; flat.push(d.elbowZ, d.wristZ); }
+    if (a) for (const s of ["left", "right"]) { const d = a[s] || {}; flat.push(d?.x, d?.y, d?.z); }
+    if (bw) for (const k of Object.keys(bw)) { const p = bw[k]; if (p) flat.push(p.x, p.y, p.z); }
+    return { flat, z, a, bw };
+  };
   let prev = null;
   let streak = 0;
   let elapsed = 0;
-  let probe = await page.evaluate(() => window.__zProbe());
+  let sample = await page.evaluate(extract);
   while (elapsed <= maxMs) {
-    const cur = [probe?.left?.elbowZ, probe?.right?.elbowZ];
     if (prev) {
-      const deltas = cur.map((v, i) => (v == null || prev[i] == null ? Infinity : Math.abs(v - prev[i])));
-      const maxDelta = Math.max(...deltas);
+      const deltas = sample.flat.map((v, i) => (v == null || prev[i] == null ? Infinity : Math.abs(v - prev[i])));
+      const maxDelta = deltas.length ? Math.max(...deltas) : Infinity;
       if (maxDelta < epsilon) {
         streak++;
-        if (streak >= stableStreak) return { probe, converged: true, elapsedMs: elapsed };
+        if (streak >= stableStreak) return { z: sample.z, arm: sample.a, bw: sample.bw, converged: true, elapsedMs: elapsed };
       } else {
         streak = 0;
       }
     }
-    prev = cur;
+    prev = sample.flat;
     if (elapsed >= maxMs) break;
     await sleep(intervalMs);
     elapsed += intervalMs;
-    probe = await page.evaluate(() => window.__zProbe());
+    sample = await page.evaluate(extract);
   }
-  return { probe, converged: false, elapsedMs: elapsed };
+  return { z: sample.z, arm: sample.a, bw: sample.bw, converged: false, elapsedMs: elapsed };
+}
+
+/** 後方互換ラッパ: 既存ケースの `{ probe, converged, elapsedMs }` 形状をそのまま返す(probe=__zProbe()の値)。
+ * 内部はpollConverge()に一本化されており、__armProbe/__boneWorldProbeが存在すればその収束も
+ * 待ってから返るため、zProbeしか見ていない既存ケースも副次的にスラープ収束の恩恵を受ける。 */
+async function pollUntilStable(page, opts) {
+  const r = await pollConverge(page, opts);
+  return { probe: r.z, converged: r.converged, elapsedMs: r.elapsedMs };
 }
 
 /** 各ケース冒頭の決定論化: __resetCalibration() -> __setManualCal(0.27,0.25) -> (任意)__setHfov/__setHandCal */
@@ -319,8 +348,11 @@ const CASES = [
       const ysRight = [];
       for (const a of angles) {
         await evalHook(page, "__simElev", [a]);
-        await pollUntilStable(page);
-        const ap = await page.evaluate(() => window.__armProbe());
+        // g1タスク: __armProbeの収束をpollConverge()で直接待ってから読む(旧実装は__zProbeの
+        // 収束だけを待って別途__armProbeを1回読んでいたため、低fps環境でスラープ未収束の
+        // 値を拾う余地があった)。
+        const conv = await pollConverge(page);
+        const ap = conv.arm;
         ysLeft.push(ap && ap.left ? ap.left.y : null);
         ysRight.push(ap && ap.right ? ap.right.y : null);
       }
@@ -462,15 +494,19 @@ const CASES = [
       // 基準姿勢(tpose)での左腕方向xを符号の基準として取得
       await resetAndCal(page);
       await evalHook(page, "__simPose", ["tpose"]);
-      await pollUntilStable(page);
-      const baseArm = await page.evaluate(() => window.__armProbe());
+      // g1タスク: __armProbeの収束をpollConverge()で直接待つ(旧実装は__zProbeの収束後に
+      // __armProbeを別途1回読むだけだったため、headless低fps環境でスラープ未収束の
+      // crossArm.left.xを拾いFAILする不具合を実測確認済み。2026-07-03高負荷実測: +0.22のまま=
+      // "down"姿勢に近い未収束値)。
+      const convBase = await pollConverge(page);
+      const baseArm = convBase.arm;
 
       // 改めてクリーンな状態からクロスポーズへ
       await resetAndCal(page);
       await evalHook(page, "__simCross", [40]);
-      const conv = await pollUntilStable(page);
-      const arm = await page.evaluate(() => window.__armProbe());
-      return { baseArm, arm, probe: conv.probe };
+      const conv = await pollConverge(page);
+      const arm = conv.arm;
+      return { baseArm, arm, probe: conv.z };
     },
     assert(result) {
       const p = result.probe;
@@ -494,6 +530,59 @@ const CASES = [
         note:
           "__simCrossの厳密な幾何はs2-hooks実装依存のため閉形式の数値目標は設定せず、" +
           "符号(z<0)・NaN/爆発なし・armProbeのx符号反転のみを判定基準にする(CONTRACT.md該当行と一致)。",
+      };
+    },
+  },
+  {
+    // g1タスク: 「前方リーチでVRMアバターが背中方向へ腕を伸ばす」という実機報告(punch-fix以降のUX観測)の
+    // 恒久回帰ガード。__boneWorldProbeの実測値(handZ-chestZ)を直接判定基準にする点が
+    // new-cross-40(__armProbeのx符号反転のみを見る)と異なり、絶対的な前後方向そのものを検証する。
+    id: "new-absolute-forward",
+    desc: "__simReach(60)(両腕): 左右ともhandZ-chestZが大きく正(=前方)。tpose基準値との対比も記録。背面リーチ回帰の恒久ガード",
+    requiredHooks: ["__resetCalibration", "__setManualCal", "__simReach", "__simPose", "__boneWorldProbe"],
+    async run(page) {
+      // tpose基準値(参考。前方でも後方でもない中立姿勢でのhandZ-chestZ)
+      await resetAndCal(page);
+      await evalHook(page, "__simPose", ["tpose"]);
+      const convT = await pollConverge(page);
+      const bwT = convT.bw || (await page.evaluate(() => window.__boneWorldProbe()));
+
+      // 本題: 両腕前方リーチ60°
+      await resetAndCal(page);
+      await evalHook(page, "__simReach", [60]);
+      const convR = await pollConverge(page);
+      const bwR = convR.bw || (await page.evaluate(() => window.__boneWorldProbe()));
+
+      const dz = (bw) => ({ left: bw.leftHand.z - bw.chest.z, right: bw.rightHand.z - bw.chest.z });
+      return { dzTpose: dz(bwT), dzReach60: dz(bwR), convergedT: convT.converged, convergedR: convR.converged };
+    },
+    assert(result) {
+      // 閾値+0.15m の根拠(expectations.md参照): 修正後の実測はleft/rightとも+0.334〜+0.336mに
+      // 3回の独立実行で収束(理論チェーン長(U+F)*sin60°=0.4503mに対しVRMボーンスケールを反映した値)。
+      // 修正前バグ値は-0.385m前後(符号が逆)だった。+0.15mは両者を確実に判別しつつ、
+      // 実行間のフィルタ収束ばらつきを吸収する余裕を持たせた値。
+      const THRESH = 0.15;
+      const passL = result.dzReach60.left > THRESH;
+      const passR = result.dzReach60.right > THRESH;
+      const pass = passL && passR;
+      const detail =
+        `reach60: left=${fmt(result.dzReach60.left)} right=${fmt(result.dzReach60.right)} (要 > +${THRESH}) / ` +
+        `tpose基準: left=${fmt(result.dzTpose.left)} right=${fmt(result.dzTpose.right)} / ` +
+        `converged(tpose/reach60)=${result.convergedT}/${result.convergedR}`;
+      return {
+        pass,
+        detail,
+        actual: result.dzReach60,
+        expected: { left: `> +${THRESH}`, right: `> +${THRESH}`, note: "handZ-chestZ (VRM world, m)" },
+      };
+    },
+    dryRunPreview() {
+      return {
+        note:
+          "理論チェーン長(U+F)*sin60°=0.4503m(MediaPipe座標)に対応するVRMワールド換算値。" +
+          "修正後の実測ではleft/rightとも+0.334〜+0.336mに収束(3回の独立実行で確認、expectations.md参照)。" +
+          "閾値+0.15mは旧バグ値(-0.385m前後)を確実に判別しつつ実行間ばらつきを吸収するための余裕を持たせた値。",
+        "reach60理論チェーン長(U+F)*sin60°": ((U + F) * Math.sin(deg2rad(60))).toFixed(4),
       };
     },
   },
@@ -760,6 +849,154 @@ const CASES = [
           "__simReachLR(80,80)のlm2投影2D長はtposeの約17%(cos80°≈0.174)まで縮むため、" +
           "CAL_NEAR_MAX_RATIO=0.92のゲートで確実に棄却されるはず(0.174 < 0.92)。" +
           "棄却が機能していれば最終L_ua/L_faはtpose理論値0.27/0.25付近に留まる。",
+      };
+    },
+  },
+  {
+    // g2タスク新規ケース: ポーズ非依存キャリブレーション(1) — Y字ポーズでも較正が成立すること。
+    // buildPoseElev(45)は腕を画像平面内(z=0で固定)で仰角45°に上げたY字相当のポーズ。
+    // 実機ユーザー観測(CONTRACT.md背景)は「Tポーズだと手が画面に入らずY字にしたら較正が
+    // 過小推定になった」というものだったため、Y字そのもの(z=0で画面と平行)では正しく
+    // 理論値どおりに較正できることを確認する(=ポーズの見た目ではなく各セグメントの
+    // 画面平行性だけが条件であることの直接証明)。
+    id: "new-calibration-ypose",
+    desc: "buildPoseElev(45)(Y字相当、腕は画像平面内=z一定)で手動較正→採用L_ua/L_faが理論値0.27/0.25(±10%)",
+    requiredHooks: ["__resetCalibration", "__simElev", "__calProbe"],
+    async run(page) {
+      await evalHook(page, "__resetCalibration", []);
+      await evalHook(page, "__simElev", [45]);
+      const hasCalBtn = await page.evaluate(() => !!document.getElementById("calBtn"));
+      if (!hasCalBtn) {
+        const e = new Error("#calBtn が見つからない(手動較正UIが無い)");
+        e.hookMissing = true;
+        throw e;
+      }
+      await page.click("#calBtn");
+      await sleep(3500); // MANUAL_CAL_MS(3000ms) + 余裕分
+      const probe = await page.evaluate(() => window.__calProbe());
+      return { probe };
+    },
+    assert(result) {
+      const p = result.probe;
+      if (!p) return { pass: false, detail: "__calProbe()がnull(較正が完了していない)", actual: p };
+      const boneOk = p.ok?.bone === true;
+      const uaOk = within(p.adopted?.L_ua, U, 0.1, "rel");
+      const faOk = within(p.adopted?.L_fa, F, 0.1, "rel");
+      const pass = boneOk && uaOk && faOk;
+      const detail =
+        `ok.bone=${boneOk} adopted.L_ua=${fmt(p.adopted?.L_ua)}(理論${U}, ±10%) adopted.L_fa=${fmt(p.adopted?.L_fa)}(理論${F}, ±10%) samples=${JSON.stringify(p.samples)}`;
+      return {
+        pass,
+        detail,
+        actual: p,
+        expected: { boneOk: true, L_ua: `${U}±10%`, L_fa: `${F}±10%` },
+      };
+    },
+    dryRunPreview() {
+      return {
+        note:
+          "buildPoseElev(45)は腕を画像平面内(z=0一定)で仰角45°に上げるY字相当のポーズ。" +
+          "セグメント単位の絶対平面性チェック(|Δz|<0.06)は常にΔz=0で通過するはず。",
+        "理論L_ua/L_fa": `${U} / ${F}`,
+      };
+    },
+  },
+  {
+    // g2タスク新規ケース: ポーズ非依存キャリブレーション(2) — 前傾姿勢の棄却(絶対平面性チェック)。
+    // __simReachLR(80,80)を使った既存の parallelism-gate ケース(相対ゲート=ランニング最大比)とは
+    // 異なり、こちらは「セッション全体を通して一定角度だけ前傾したまま」というシナリオを再現する。
+    // 相対ゲートだけでは、セッション中ずっと同じ角度なら"ランニング最大値=常にその角度の値"に
+    // なってしまい毎フレーム自分自身と比較して合格してしまう(=相対ゲートが無力化される)。
+    // 絶対平面性チェック(CAL_PLANAR_Z_THRESH)を追加した理由そのものを直接検証するケース。
+    id: "new-calibration-frontlean-rejected",
+    desc: "__simReach3D(30,45)(前傾を含むリーチ)を較正中ずっと維持→絶対平面性チェックが全フレーム棄却しbone=falseのまま(既定値から汚染されない)",
+    requiredHooks: ["__resetCalibration", "__simReach3D", "__calProbe"],
+    async run(page) {
+      await evalHook(page, "__resetCalibration", []);
+      await evalHook(page, "__simReach3D", [30, 45]);
+      const hasCalBtn = await page.evaluate(() => !!document.getElementById("calBtn"));
+      if (!hasCalBtn) {
+        const e = new Error("#calBtn が見つからない(手動較正UIが無い)");
+        e.hookMissing = true;
+        throw e;
+      }
+      await page.click("#calBtn");
+      await sleep(3500);
+      const probe = await page.evaluate(() => window.__calProbe());
+      return { probe };
+    },
+    assert(result) {
+      const p = result.probe;
+      if (!p) return { pass: false, detail: "__calProbe()がnull(較正が完了していない)", actual: p };
+      const boneOk = p.ok?.bone === true;
+      const noSamples = p.samples?.ua === 0 && p.samples?.fa === 0;
+      const pass = !boneOk && noSamples;
+      const detail =
+        `ok.bone=${boneOk}(期待false) samples=${JSON.stringify(p.samples)}(期待ua=0,fa=0) ` +
+        `adopted.L_ua/L_fa=${fmt(p.adopted?.L_ua)}/${fmt(p.adopted?.L_fa)}(参考、汚染されなければ既定値0.28/0.25のまま)`;
+      return {
+        pass,
+        detail,
+        actual: p,
+        expected: { boneOk: false, samplesUa: 0, samplesFa: 0 },
+      };
+    },
+    dryRunPreview() {
+      const elbowDz = Math.abs(reach3DElbowZ(30, 45)); // = |z(elbow)-z(shoulder)|, shoulder.z=0
+      const wristDz = Math.abs(reach3DWristZ(30, 45) - reach3DElbowZ(30, 45)); // = |z(wrist)-z(elbow)|
+      return {
+        note: "CAL_PLANAR_Z_THRESH既定0.06m。az=30°,el=45°ではua/fa両セグメントとも|Δz|が閾値超のため、収集ウィンドウ全体で1サンプルも採用されないはず。",
+        "|Δz|(shoulder-elbow, ua)": elbowDz.toFixed(4) + " > 0.06",
+        "|Δz|(elbow-wrist, fa)": wristDz.toFixed(4) + " > 0.06",
+      };
+    },
+  },
+  {
+    // g2タスク新規ケース: ポーズ非依存キャリブレーション(3) — 左右独立ゲート。
+    // 左腕(reachDeg=0、Tポーズ相当でz=0固定=常に画面平行)と右腕(reachDeg=75、常時大きく
+    // 前傾=常に棄却)を同時に3秒間流し続ける。g1以前の実装は"ua2d"/"fa2d"が左右共有だったため、
+    // 例えばこのケースでは右腕(実際には棄却されるべき)の値が左腕のランニング最大値の分母に
+    // 混ざる余地があった。g2でセグメントをchildIndex単位(ua_13/ua_14/fa_15/fa_16)に分離した
+    // ことで、左腕の較正が右腕の状態と無関係に成立することを直接確認する。
+    id: "new-calibration-side-independent",
+    desc: "__simReachLR(0,75)を較正中維持(左=常時平行/右=常時棄却)→左のサンプルのみでL_ua/L_faが理論値にほぼ厳密一致し、右腕の非平行に汚染されない",
+    requiredHooks: ["__resetCalibration", "__simReachLR", "__calProbe"],
+    async run(page) {
+      await evalHook(page, "__resetCalibration", []);
+      await evalHook(page, "__simReachLR", [0, 75]);
+      const hasCalBtn = await page.evaluate(() => !!document.getElementById("calBtn"));
+      if (!hasCalBtn) {
+        const e = new Error("#calBtn が見つからない(手動較正UIが無い)");
+        e.hookMissing = true;
+        throw e;
+      }
+      await page.click("#calBtn");
+      await sleep(3500);
+      const probe = await page.evaluate(() => window.__calProbe());
+      return { probe };
+    },
+    assert(result) {
+      const p = result.probe;
+      if (!p) return { pass: false, detail: "__calProbe()がnull(較正が完了していない)", actual: p };
+      const boneOk = p.ok?.bone === true;
+      const uaOk = within(p.adopted?.L_ua, U, 0.05, "rel"); // 左のみの寄与のため厳密一致に近い値のはず
+      const faOk = within(p.adopted?.L_fa, F, 0.05, "rel");
+      const pass = boneOk && uaOk && faOk;
+      const detail =
+        `ok.bone=${boneOk} adopted.L_ua=${fmt(p.adopted?.L_ua)}(理論${U}, ±5%) adopted.L_fa=${fmt(p.adopted?.L_fa)}(理論${F}, ±5%) samples=${JSON.stringify(p.samples)}`;
+      return {
+        pass,
+        detail,
+        actual: p,
+        expected: { boneOk: true, L_ua: `${U}±5%`, L_fa: `${F}±5%` },
+      };
+    },
+    dryRunPreview() {
+      return {
+        note:
+          "reachDeg=0(左、Tポーズ相当でz=0固定)とreachDeg=75(右、|Δz|=U·sin75°≈0.2608>>0.06で常時棄却)を" +
+          "同時に流す。左右独立ゲートが機能していれば左のサンプルだけが採用され、理論値にほぼ厳密一致するはず。",
+        "理論L_ua/L_fa(左のみ寄与)": `${U} / ${F}`,
       };
     },
   },

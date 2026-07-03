@@ -454,3 +454,383 @@ CAL_NEAR_MAX_RATIO=0.92 のゲート判定: 0.1736 < 0.92 → 確実に棄却さ
   本タスクでは変更していない。
 - 上記の切り分けにより、f1タスクの変更(ヒステリシス化・slerpフロア調整・ドリフトクランプ・
   手動較正の平行性ゲート・較正フィードバックUI)が新たな回帰を生んでいないことを確認した。
+
+## 9. g1タスク: 背面リーチ(前後逆転)バグの修正と恒久回帰ガード
+
+### 9.1 バグの実証(`__boneWorldProbe`)
+
+実機報告(「Y字ポーズで較正後、腕を前に出すとサンプルVRMアバターが背中方向へ腕を伸ばす」)を
+`window.__boneWorldProbe(names?)`(新規・読み取り専用。`currentVrm.humanoid.getNormalizedBoneNode(name)
+.getWorldPosition()`をそのまま返すだけで判定ロジックには一切関与しない)で実証した。
+
+手順: `__resetCalibration()` → `__setManualCal(0.27,0.25)` → `__simReach(60)`(両腕前方60°) →
+収束待ち(§9.3のpollConverge) → `__boneWorldProbe(["leftHand","rightHand","chest"])`で
+`handZ − chestZ`を測定。three.jsシーンの規約(CONTRACT.md: 既定カメラ(0,0.85,3.0)が+Z側から
+アバターを見る=アバターは+Z方向を向く)より、`handZ − chestZ`が正なら前方、負なら背面。
+
+**修正前の実測値(3回の独立実行で再現、いずれも同一パターン)**:
+```
+reach60: handZ-chestZ  left=-0.3857  right=-0.3871   (tpose基準: left=-0.0184 right=-0.0162)
+```
+理論上は前方(+)になるべきところ大きく負(-0.39m前後)になっており、実機報告どおり
+「前方リーチのはずが背面へ伸びる」バグを定量的に再現できた。`__zProbe()`(MediaPipe world座標系での
+elbowZ/wristZ)は理論値(`-U·sin60°=-0.2338`, `-(U+F)·sin60°=-0.4503`)と完全一致しており、
+**world zの計算自体(fuseArmZ/resolveSign)は正しい**ことも同時に確認した
+(実機デバッグパネルの「sign L=1/1」観測と整合)。問題はVRMボーン回転への写像だけに絞り込めた。
+
+### 9.2 原因箇所と修正(`avatar-depth.html:1560-1577`付近、`animateVRM`内)
+
+`armSagittal(w, sIdx, eIdx, leftSide)`(前後角を`atan2(forward, outward)`で算出、`forward`は
+両側で符号統一済み=前方なら常に正)の出力に、左右のボーン局所軸のミラー関係を表す
+`SAG_L=1, SAG_R=-1`(既定値、`avatar-depth.html:286`)を掛けて`rp.LeftUpperArm.y`/
+`rp.RightUpperArm.y`へ上書きしていた。この`SAG_L/SAG_R`は「ヘッドレスで決定」(既存コメント)
+された値で、`__boneWorldProbe`のような絶対座標ベースの検証を経ておらず、実際には
+**両腕とも符号が反転していた**(`SAG_L=1,SAG_R=-1` → 両方 backward、正しくは
+`SAG_L=-1,SAG_R=1`相当でforward)。
+
+`__setSag(l,r,s)`で総当たり実験した結果:
+```
+デフォルト(SAG_L=1,SAG_R=-1):     left=-0.386  right=-0.387  (背面、バグ再現)
+__setSag(-1, 1):                left=+0.336  right=+0.334  (前方、正しい)
+__setSag(-1,-1) / __setSag(1,1): 左右どちらかのみ正しい(左右が別々に壊れているのではなく、
+                                  丸ごと反転で両方直ることを確認 = 左右ミラー関係自体は
+                                  壊れておらず、絶対方向だけが全体的に反転していた)
+```
+この「丸ごと反転」というパターンは、`avatar-depth.html:1531`で仰角(z)成分に既に適用されている
+`const sgn = isVRM0 ? 1 : -1;`(VRM0/VRM1のrotateVRM0による180°回転の補正)と同種の現象と推測し、
+同梱サンプルVRM(`https://.../three-vrm-girl.vrm`、glTF拡張を確認したところ`extensions.VRM`
+(0.x形式)を持ちVRMC_vrmは無い=**VRM0**)について、以下の`sagSgn`を追加することで修正した:
+
+```js
+const sagSgn = isVRM0 ? -1 : 1;   // z成分のsgn(isVRM0?1:-1)とは極性が逆
+const rawL = SAG_L * sagSgn * armSagittal(src3d, 11, 13, true) * SAG_SCALE;
+const rawR = SAG_R * sagSgn * armSagittal(src3d, 12, 14, false) * SAG_SCALE;
+```
+
+`isVRM0=true`(同梱サンプル)のとき`sagSgn=-1`となり、`SAG_L(1)*sagSgn(-1)=-1`,
+`SAG_R(-1)*sagSgn(-1)=+1`と、実験で確認した「丸ごと反転」後の値に一致する。
+`SAG_L/SAG_R`自体の既定値(1/-1)は変更しておらず、左右のミラー関係を表す値としてそのまま残した
+(`__setSag`の互換性を保つため。挙動を変えたい場合は`sagSgn`適用後の実効値を
+逆算して`__setSag`に渡せばよい)。**z成分の`sgn`とは極性が逆**(z: VRM0で無反転/VRM1で反転、
+y: VRM0で反転/VRM1で無反転)である点は、Kalidokitのオイラー分解順序とthree-vrmの正規化ボーン軸が
+z成分とy成分で異なる影響を受けるためと推測されるが、第一原理からの完全な導出はできておらず、
+**実測ベースの経験的な修正**であることを明記する。VRM1側(`sagSgn=1`=変更なし)は手元に
+VRM1モデルが無いため未検証(z側の実装時と同じ前提を踏襲した設計)。
+
+**修正後の実測値(3回の独立実行、いずれも寸分違わず一致)**:
+```
+reach60: handZ-chestZ  left=+0.3358  right=+0.3343   (tpose基準: left=+0.008〜+0.028 right=+0.016〜+0.020)
+```
+World z(`__zProbe`)は`left.elbowZ=-0.2338, wristZ=-0.4503`のまま変化なし
+(理論値と完全一致、resolveSign/armSagittal自体・fuseArmZの幾何チェーンには一切手を入れていないことの裏付け)。
+
+### 9.3 タイミング脆弱性の修正: `pollConverge`(`run.mjs`)
+
+旧`pollUntilStable`は`__zProbe().{left,right}.elbowZ`のみを100ms間隔・上限3秒・閾値0.002で
+監視していた。`__zProbe`の値はOne Euroフィルタ(dt基準)で収束するが、`rigRotation`の
+`node.quaternion.slerp(target, SMOOTH)`は**フレーム数ベースの固定ブレンド率**(dt非依存、
+`avatar-depth.html`の`rigRotation`実装どおり)で収束するため、headless低fps環境(高負荷時)では
+同じ壁時計時間でも消化できるフレーム数が減り、「`__zProbe`は収束済みだが`__armProbe`の実ボーン
+回転はまだ動いている」という乖離が生じうる。`new-cross-40`は`__armProbe`の値を直接assertする
+ため、この乖離の影響を受けやすい。
+
+**実測(2026-07-03、12倍CPUスロットリング下で3回反復、scratchpad/throttle-cross40.mjs)**:
+```
+旧実装(__zProbeのみ、100ms/3秒上限/閾値0.002):
+  run1: crossArm.left.x=0.57 flipped=false (FAIL)
+  run2: crossArm.left.x=0.54 flipped=false (FAIL)
+  run3: crossArm.left.x=0.54 flipped=false (FAIL)   ← 3回とも収束途中の値でFAIL
+
+新実装pollConverge(__zProbe+__armProbe+__boneWorldProbe、200ms/8秒上限/閾値0.01):
+  run1: crossArm.left.x=-0.27 flipped=true (PASS)
+  run2: crossArm.left.x=-0.27 flipped=true (PASS)
+  run3: crossArm.left.x=-0.27 flipped=true (PASS)   ← 3回とも正しく収束後の値でPASS
+```
+`pollConverge(page, opts)`(`run.mjs`)は`__zProbe`/`__armProbe`/`__boneWorldProbe`(存在すれば)の
+数値をすべてフラット化し、200ms間隔で2回連続<0.01の変化に収まるまで待つ(上限8秒)。
+旧`pollUntilStable(page, opts)`は`pollConverge`の薄いラッパとして残し(`{probe, converged,
+elapsedMs}`の形状を維持)、既存の全呼び出し箇所を変更せずに恩恵を受けられるようにした。
+`regression-elev-sweep`と`new-cross-40`(いずれも`__armProbe`を直接assertする既存2ケース)は
+`pollUntilStable`ではなく`pollConverge`を直接呼ぶ形に変更し、収束済みの`arm`フィールドを
+再取得なしでそのまま使う(別途`page.evaluate(() => window.__armProbe())`を呼ぶタイムラグを解消)。
+
+通常負荷下(スロットリングなし)では3回連続実行してPASS=14 FAIL=0を再現確認済み(本文§10参照)。
+
+### 9.4 新規恒久回帰ケース: `new-absolute-forward`
+
+§4.4の`new-cross-40`が「基準姿勢との相対的なx符号反転」のみを見るのに対し、本ケースは
+`__boneWorldProbe`の絶対値(`handZ-chestZ`)を直接assertし、「背中に伸びない」ことそのものを
+恒久的にガードする。
+
+```
+理論チェーン長: (U+F)*sin60° = 0.52 * 0.86603 = 0.45114 (MediaPipe座標系, wristZの理論値の大きさ)
+修正後の実測: reach60時 handZ-chestZ = left +0.3358, right +0.3343 (3回の独立実行で
+             +0.334〜+0.336の範囲に収束、寸分の違いはOne Euroフィルタの初期状態依存)
+修正前(バグ)の実測: left -0.3857, right -0.3871
+```
+判定閾値は`+0.15`(m)。根拠: 修正後の実測値(+0.33台)の半分以下に設定することで実行間の
+フィルタ収束ばらつきを十分吸収しつつ、修正前のバグ値(-0.39台)とは符号はもちろん絶対値でも
+大きく乖離しているため、`+0.15`を跨いで誤判定する余地はない。tpose基準値
+(`handZ-chestZ`が±0.03程度、中立姿勢なので理論上0付近)も併記し、reach60の値が
+「中立から明確に前方へ動いた」ことも参考情報として記録する。
+
+## 10. g1タスクでの実走結果まとめ
+
+`node test/sim/run.mjs`(g1タスクの変更後、既存13ケース+新規1ケースの計14ケース)を実行した結果:
+**PASS=14 FAIL=0 SKIP=0 ERROR=0**(3回連続実行して再現性も確認済み)。
+
+- 新規`new-absolute-forward`は**PASS**(§9.4)。
+- 従来FAILしていた`new-cross-40`(f1タスク報告の既知問題、§8参照)は、`pollConverge`導入により
+  **PASS**に転じた。原因はテスト側のタイミング脆弱性であり(§9.3)、`buildPoseCross`自体の
+  角度設計(理論値未設定、不変量ベース判定)は変更していない。
+- 他12ケース(回帰3件+新規9件+任意1件)は全てPASS、g1タスクの変更(`sagSgn`の追加、
+  `pollConverge`への一本化)による回帰は観測されなかった。
+- `regression-elev-sweep`(`__armProbe`の`y`成分の単調性のみを見る既存ケース)は、
+  `sagSgn`の変更が仰角(elev)スイープには影響しないことも確認できた。`buildPoseElev`は
+  肘/手首のworld z成分を常に0にする(前額面内のみの動き)ため、`armSagittal`(z成分の差分から
+  角度を出す関数)の出力は`sagSgn`の値によらず常に0になり、矢状角の上書きパス自体は通っても
+  実質的な影響が生じない。`__armProbe`が見ている「world空間でのy(上下)方向」は
+  仰角(z)成分の`sgn=isVRM0?1:-1`(g1タスクでは変更していない既存ロジック)で決まるため、
+  今回の`sagSgn`追加とは独立に単調性が保たれる。
+
+## 11. g2タスク: ポーズ非依存キャリブレーション(T字/Y字/サボテン対応)
+
+### 11.1 背景と方針
+
+実機ユーザー観測(CONTRACT.md): 「Tポーズだと手が画面に入らない」ためY字で較正したところ
+`L_ua=0.213/L_fa=0.197`(理論比でそれぞれ約79%)まで過小推定され、手アンカーのリーチ度`ρ`が
+`HA.CAL_RHO_MAX`未満に収まらず`w=0.00`まで抑制されて手アンカーが事実上封殺された。
+
+数学的な必要条件は「Tポーズであること」ではなく「各腕セグメント(上腕・前腕それぞれ)が
+画像平面と平行であること」+「手が画面内にあること」。`stepManualCalibration`
+(`avatar-depth.html`)の既存の相対ゲート(`CAL_NEAR_MAX_RATIO`、そのセッション内でのランニング
+最大2D長との比較)は、**セッション全体が一貫して前傾している場合には無力**という弱点がある
+(全フレームが同程度に縮んでいれば、ランニング最大値自体も縮んだ値に落ち着き、以後の全フレームが
+「ランニング最大の92%以上」を満たして合格し続けてしまう)。これがY字較正での過小推定を
+説明する仮説である。
+
+g2タスクでは、この相対ゲートに加えて **MediaPipe world zを使った絶対的な平面性チェック**を
+導入した。既存の相対ゲートは維持しつつ(混入姿勢の検出には引き続き有効、§7.2/11.4参照)、
+新たに「セグメント両端点のworld z差」を直接見ることで、セッション全体の前傾も検出できるように
+した。
+
+### 11.2 実装(`avatar-depth.html`、行番号は本タスク完了時点)
+
+- L271-272: ボタンラベルを`CAL_BTN_LABEL_IDLE`定数に外出し(`"📐 キャリブレーション（3秒・
+  T字/Y字/サボテン可）"`)。
+- L173-174 (HTML): ボタンラベル更新＋ヘルプ1行を新規追加
+  (`「腕の各パーツが画面と平行になるポーズで。手まで画面内に入れると手アンカーも較正されます。」`)。
+- L896-919: `manualCalBuf`を`{ua2d, fa2d}`(左右共有)から`{ua_13, ua_14, fa_15, fa_16}`
+  (childIndexキー、左右完全独立)に変更。`resetManualCalBuf()`ヘルパーを新設し
+  `startManualCalibration`/`__resetCalibration`の両方から呼ぶ形に統一。
+- L907-910: 新規定数`CAL_PLANAR_Z_THRESH`(既定0.06m、`__setCalPlanarZThresh`)と
+  `MANUAL_CAL_VIS_MIN`(既定0.6、`__setManualCalVisMin`)を追加。
+- L926-950 (`stepManualCalibration`): セグメントループ内で
+  - visibilityしきい値を既存の`visOk`既定0.5から`MANUAL_CAL_VIS_MIN`(0.6)に引き上げ
+  - `Math.abs(world[bI].z - world[aI].z) >= CAL_PLANAR_Z_THRESH`を新たな棄却条件として追加
+    (相対ゲートの前に評価、両方を満たしたサンプルだけが`seg2DLen`/`seg3DLenXY`の計算に進む)
+  - 相対ゲートの`maxKey`を`key + "2d"`(共有)から`key + "_" + bI`(左右独立)に変更
+- 自動較正(`updateBoneCalibration`)・`fuseArmZHybrid`・`resolveSign`・`armSagittal`等の
+  幾何チェーンには一切手を入れていない(制約どおり)。
+
+### 11.3 閾値の選定根拠
+
+**`CAL_PLANAR_Z_THRESH = 0.06`[m]**: `L_ua≈0.27`/`L_fa≈0.25`に対し、セグメントが画面法線
+(視線方向)から角度`θ`だけ傾いているとき`|Δz| = L·sin(θ)`となる。
+`0.06/0.27 → θ≈13.3°`、`0.06/0.25 → θ≈13.9°`。すなわちこの閾値は**画面平行から
+約13〜14°以内の傾きは許容**しつつ、それを超える傾きは棄却する設計になっている。
+
+この値の妥当性を新規ケースで両側から検証した:
+- 許容側: `new-calibration-ypose`(`buildPoseElev(45)`、Y字ポーズ。腕が前額面内=z一定=θ=0°)
+  → 全フレーム`|Δz|=0`で通過、理論値どおり較正できる(§11.4.1)。
+- 棄却側: `new-calibration-frontlean-rejected`(`__simReach3D(30,45)`)
+  → `|Δz|(ua)=0.0955m`, `|Δz|(fa)=0.0884m`(いずれも導出はθ=arcsin(sin(45°)·sin(30°))相当の
+  複合角で、0.06mを大きく超える)で全フレーム棄却される(§11.4.2)。この角度は実機観測の
+  「Y字較正でやや前傾していた」を模した中程度の前傾であり、少なくともこの程度の前傾は
+  確実に弾けることを保証する。
+
+**`MANUAL_CAL_VIS_MIN = 0.6`**: 自動較正(`updateBoneCalibration`)の`visOk`既定0.5より
+やや厳しい値。手動較正は3秒間という短いウィンドウの中から「一部の良質なフレームだけ」を
+選別できればよく(自動較正のように継続的にサンプルを積み増す必要がない)、より高いvisibilityを
+要求しても実用上支障がないと判断した。既定の`visOk`引数化を使い回しているため実装コストは
+実質ゼロ(`visOk(world, idx, MANUAL_CAL_VIS_MIN)`)。sim側のフィクスチャは全て`visibility:1`
+固定のため、この変更によるsim既存ケースへの回帰は発生しない。
+
+### 11.4 新規ケース
+
+#### 11.4.1 `new-calibration-ypose`
+
+`__simElev(45)`(=`buildPoseElev(45)`、Y字相当。肘・手首のworld z成分は仰角によらず常に0)を
+流した状態で`#calBtn`をクリックし、`MANUAL_CAL_MS(3000ms)`+500ms待って`__calProbe()`を読む。
+
+```
+理論値: L_ua=0.2700, L_fa=0.2500 (buildPoseElevの11-13/13-15セグメント長がU=0.27/F=0.25と
+        厳密に一致、z=0のためCAL_PLANAR_Z_THRESHは常に通過)
+期待:   ok.bone===true, adopted.L_ua/L_fa が理論値の±10%以内
+```
+
+実測: `ok.bone=true adopted.L_ua=0.2700 adopted.L_fa=0.2500 samples={"ua":32,"fa":32,...}`で
+**PASS**。「Tポーズでなくても、各セグメントが画面平行でありさえすれば較正が理論値どおりに
+成立する」ことを直接確認した(Y字だから過小推定になるわけではなく、腕が前後に傾いていたことが
+原因だったという背景仮説と整合)。
+
+#### 11.4.2 `new-calibration-frontlean-rejected`
+
+`__simReach3D(30, 45)`(方位角30°+仰角45°の複合リーチ。前傾を含む)を**較正開始前から
+終了まで一定に維持したまま**(§7.2の`parallelism-gate`ケースと異なり、混入ではなく
+セッション全体が一貫して同じ角度)`#calBtn`をクリックし、3.5秒待って`__calProbe()`を読む。
+
+```
+reach3DDir(30°,45°)より (avatar-depth.html:1821-1825の式):
+  cz = cos(45°) = 0.7071
+  d.x(左) = cz·cos(30°) = 0.6124,  d.y = -sin(45°) = -0.7071,  d.z = -cz·sin(30°) = -0.3536
+  肩(shoulder)のz = 0 (全ビルダー共通)
+  肘(elbow)のz  = U·d.z = 0.27×(-0.3536) = -0.0955   → |Δz(肩-肘)| = 0.0955m
+  手首(wrist)のz = 肘のz + F·d.z = -0.0955 + 0.25×(-0.3536) = -0.1839
+                                                        → |Δz(肘-手首)| = 0.0884m
+両方とも CAL_PLANAR_Z_THRESH=0.06m を超えるため、収集ウィンドウ全体で
+上腕・前腕セグメントとも1サンプルも採用されないはず。
+期待: samples.ua===0 かつ samples.fa===0 → ok.bone===false のまま(既定値0.28/0.25から不変)
+```
+
+実測: `ok.bone=false samples={"ua":0,"fa":0,...} adopted.L_ua/L_fa=0.2526/0.2339`で**PASS**
+(`samples.ua/fa`が期待どおり0)。なお`adopted.L_ua/L_fa`が既定値(0.28/0.25)からわずかに
+ずれているのは、本タスクの変更対象外である**自動較正(`updateBoneCalibration`)が
+このシムポーズに対して独立に動作し続けている**ため(`calStatus`は手動較正完了の瞬間まで
+`"default"`のままなので、`fuseArmZHybrid`から毎フレーム呼ばれる自動較正が並行して走る)。
+自動較正は相対ゲートのみを使うため、一定角度で静止したこのポーズでは「ランニング最大値=
+常にその角度の値」となり毎フレーム自身と比較して合格してしまう(自動較正にとってはこれが
+既存の仕様であり、本タスクでは変更していない)。実測値`0.2526`は
+`U·√(1-d.z²) = 0.27×√(1-0.3536²) = 0.2526`と手計算でも完全に一致し、想定内の副作用である
+ことを確認した。手動較正自身の判定(`ok.bone`/`samples`)は自動較正の状態と独立に正しく
+機能しており、テストの主張(「絶対平面性チェックが全フレーム棄却する」)には影響しない。
+
+#### 11.4.3 `new-calibration-side-independent`
+
+`__simReachLR(0, 75)`(左=reachDeg0=Tポーズ相当でz=0固定・常時平行、右=reachDeg75=
+`|Δz|=U·sin75°≈0.2608m`で常時棄却)を較正開始前から終了まで一定に維持する。
+
+```
+左(11-13/13-15)は全フレームz=0で通過し続けるため、manualCalUA/manualCalFAには左由来の
+サンプルのみが入り、それぞれ理論値ちょうど(seg3DLenXYがz=0なのでl3=U/Fそのもの)になるはず。
+右(12-14/14-16)は全フレーム棄却されるため寄与しない。
+期待: ok.bone===true, adopted.L_ua/L_fa が理論値の±5%以内(左のみの寄与なので通常の
+      ±10%より厳しいtoleranceで検証)
+```
+
+実測(3回の独立実行): `ok.bone=true adopted.L_ua=0.2700 adopted.L_fa=0.2500`で**毎回PASS**
+(samplesは17→13→…とフレームレート依存で変動するが値自体は毎回理論値に厳密一致)。
+g1以前の実装(`manualCalBuf`が`ua2d`/`fa2d`で左右共有)では、この構成で右腕の縮んだ2D長が
+左腕のランニング最大値と混線する余地があった(本ケースは新設のためg1時点での実測比較はできないが、
+`manualCalBuf`をchildIndex単位に分離した設計意図をこのケースで直接検証している)。
+
+### 11.5 既存較正ケースの再確認(回帰なし)
+
+`new-calibration-feedback-handmissing`(§7.1)・`new-calibration-parallelism-gate`(§7.2)は
+いずれも`buildPose`系(tpose)フィクスチャを使用し、その`z`成分は常に0(全ビルダー共通)である
+ため、新設した`CAL_PLANAR_Z_THRESH`ゲートは常に通過し、挙動・実測値とも変化しないことを
+確認した(§12実走結果参照)。
+
+## 12. g2タスクでの実走結果まとめ
+
+`node test/sim/run.mjs`(g2タスクの変更後、既存14ケース+新規3ケースの計17ケース)を
+**3回連続実行**した結果、いずれも**PASS=17 FAIL=0 SKIP=0 ERROR=0**。
+
+| ケースID | 1回目 | 2回目 | 3回目 |
+|---|---|---|---|
+| regression-reach45 | PASS | PASS | PASS |
+| regression-elev-sweep | PASS | PASS | PASS |
+| regression-handanchor-elbowdeg-monotonic | PASS | PASS | PASS |
+| new-reachLR-60-0 | PASS | PASS | PASS |
+| new-reachLR-30-75 | PASS | PASS | PASS |
+| new-reach3d-45-30 | PASS | PASS | PASS |
+| new-cross-40 | PASS | PASS | PASS |
+| new-absolute-forward | PASS | PASS | PASS |
+| new-reachhand2-symmetric | PASS | PASS | PASS |
+| new-visibility-gate | PASS | PASS | PASS |
+| new-vis-hysteresis | PASS | PASS | PASS |
+| new-calibration-feedback-handmissing | PASS | PASS | PASS |
+| new-calibration-parallelism-gate | PASS | PASS | PASS |
+| **new-calibration-ypose**(新規) | PASS | PASS | PASS |
+| **new-calibration-frontlean-rejected**(新規) | PASS | PASS | PASS |
+| **new-calibration-side-independent**(新規) | PASS | PASS | PASS |
+| optional-fakedepth-sign | PASS | PASS | PASS |
+
+- 新規3ケースは全て**PASS**(§11.4)。
+- g1タスクまでの既存14ケース(回帰3件+新規9件+較正2件+任意1件)は全てPASS、
+  g2タスクの変更(`manualCalBuf`のキー方式変更、`CAL_PLANAR_Z_THRESH`/`MANUAL_CAL_VIS_MIN`の
+  追加、ボタンラベル/ヘルプ文言の変更)による回帰は観測されなかった。
+- サンプル数(`samples.ua`/`fa`等)は実行ごとにブラウザのrAFフレームレートに依存して
+  17→32→13のように変動するが(headless Chromiumの実行環境負荷による)、採否そのもの
+  (`ok.bone`の真偽・`adopted.L_ua/L_fa`の理論値一致)は3回とも安定していることを確認した。
+- 自動較正(`updateBoneCalibration`)の既存挙動(相対ゲートのみ・drift clamp等)には
+  一切手を入れておらず、`new-calibration-frontlean-rejected`で観測された自動較正側の
+  副作用(§11.4.2、`adopted.L_ua=0.2526`)も変更前から存在する仕様どおりの挙動である。
+
+## 13. g3タスク: 独立検証で発見した回帰と修正(`.panel`のビューポート溢れ)
+
+g1/g2タスクの独立検証(sim 3連続実行・敵対的コードレビュー・`probe-avatar.mjs`実測・
+側面ビュー目視確認)の過程で、**sim/コードレビューでは検出できない実UI層の回帰**を
+`test/tracking/probe-avatar.mjs`(viewport 1280×900)の実行時に発見した。
+
+### 13.1 症状
+
+`probe-avatar.mjs --media punch`が`page.click("#toggleCam")`で
+`Timeout 30000ms exceeded ... element is outside of the viewport`により失敗。
+
+### 13.2 原因
+
+`avatar-depth.html`の`.panel`は`position: fixed; left:18px; bottom:18px`で
+`max-height`/`overflow`指定が無い。g1(側面ビュー切替行+前後インジケータ行)・
+g2(較正ヘルプ文言1行)がそれぞれ`.panel`内にDOM要素を追加した結果、`.panel`の
+実測高さが**875px→992px**(+117px)に増加した。`bottom`固定パネルは内容が増えるほど
+**上方向**に伸びるため、先頭の`#toggleCam`(構造上パネル最上部)がビューポート上端より
+外に出てクリック不能になる。`html,body{overflow:hidden}`かつ`.panel`が
+`position:fixed`のため、ページスクロールでは救済されない。
+
+実測(`scratchpad/measure-panel.mjs`、`getBoundingClientRect`):
+
+| viewport高さ | 修正前 `#toggleCam` top/bottom | 修正前 `.panel`高さ | 判定 |
+|---|---|---|---|
+| 900px(probe-avatar.mjs) | -93.2 / -46.2(完全に画面外) | 992.2px | ✗ クリック不能 |
+| 800px | -193.2 / -146.2 | 992.2px | ✗ |
+| 720px(test/sim/run.mjsの既定viewport) | -273.2 / -226.2 | 992.2px | ✗(ただし後述) |
+| 1080px | +86.8 / +133.8 | 992.2px | ○ |
+
+g1/g2適用前(HEAD)の同条件では900pxで`top=+23.9`(表示可能)・800pxで`top=-76.1`
+(既に画面外)だったため、**900px viewportで動いていたものをこの2タスクの変更が壊した**
+リグレッションであると確認した(800px以下は変更前から潜在していた別問題)。
+
+`test/sim/run.mjs`はcontextにviewportを指定しておらずPlaywright既定の1280×720を使う。
+720pxでは修正前でも`#calBtn`のクリックは(bottom内3px程度がぎりぎり viewport内に
+残っていたため)たまたま成功しており、`node test/sim/run.mjs`のPASS結果だけでは
+このリグレッションを検出できなかった(`scratchpad/test-calbtn-click.mjs`で実測・再現)。
+CONTRACT.mdが指定するreach-testハーネス(probe-avatar.mjs)のviewport(900px)や、
+多くのノートPCの実ブラウザウィンドウ高でも再現しうる実利用上の不具合であり、
+「新しいUIが実カメラ経路の主要導線(カメラ開始ボタン)を押せなくする」という
+高深刻度の回帰と判断した。
+
+### 13.3 修正
+
+```css
+.panel {
+  position: fixed; left: 18px; bottom: 18px; z-index: 6; width: 270px;
+  max-height: calc(100vh - 36px); overflow-y: auto;
+  ...
+}
+```
+`.panel`自体をスクロール可能にし、ビューポートの高さに関わらず全コントロールに
+到達できるようにした。見た目は内容が収まる限り従来と同一で、溢れた場合のみ
+パネル内部にスクロールバーが出る(ページ全体やcanvasには影響しない)。
+
+### 13.4 修正後の実測
+
+| viewport高さ | `.panel`高さ | `#toggleCam` top/bottom |
+|---|---|---|
+| 900px | 864px(=900-36) | 35 / 82(画面内) |
+| 800px | 764px | 35 / 82 |
+| 720px | 684px | 35 / 82 |
+
+修正後、`probe-avatar.mjs --media punch`は正常完了(70サンプル取得、NaN 0件、
+`|zProbe|>0.78`の発散0件、最大`|z|`=0.4441m)。修正後に`node test/sim/run.mjs`を
+2回追加実行し、いずれも**PASS=17 FAIL=0**(CSSのみの変更のためロジックへの影響なし)。

@@ -56,10 +56,24 @@
     background: rgba(8,12,18,.62); border: 1px solid rgba(255,255,255,.08); backdrop-filter: blur(6px);
   }
   .chip b { color: var(--cyan); }
+  /* 前後(z)インジケータ(g1タスク): 手のワールドzが胸より前(緑)/中立(灰)/後(赤)かを常時表示 */
+  .chip.fb-chip { font-weight: 600; }
+  .chip.fb-chip b { color: inherit; }
+  .chip.fb-chip.neutral { color: var(--muted); }
+  .chip.fb-chip.fwd { color: var(--green); border-color: rgba(52,211,153,.45); background: rgba(52,211,153,.10); }
+  .chip.fb-chip.back { color: var(--danger); border-color: rgba(248,113,113,.45); background: rgba(248,113,113,.10); }
 
   /* コントロールパネル */
   .panel {
     position: fixed; left: 18px; bottom: 18px; z-index: 6; width: 270px;
+    /* g3レビューで確認: 内容が縦に増える(較正ヘルプ行・側面ビュー行・前後インジケータ行など)ほど
+       bottom固定のパネルは上方向に伸び、ビューポートが低い(実測: 高さ992pxのパネルに対し
+       ビューポート900px以下)と先頭の#toggleCamがビューポート上端より外に出てクリック不能になる
+       (position:fixedはページスクロールの影響を受けず、html/bodyのoverflow:hiddenにより
+       救済されない)。max-height+overflow-yでパネル自身をスクロール可能にし、ビューポートの
+       高さに関わらず全コントロールに到達できるようにする(見た目は現状維持、はみ出た時のみ
+       スクロールバーが出る)。 */
+    max-height: calc(100vh - 36px); overflow-y: auto;
     background: var(--panel); border: 1px solid var(--line); border-radius: 16px;
     padding: 16px; display: flex; flex-direction: column; gap: 14px;
     backdrop-filter: blur(12px); box-shadow: 0 20px 50px rgba(0,0,0,.45);
@@ -164,7 +178,8 @@
         <button class="btn-ghost" data-zmethod="legacy" title="avatar.htmlと同じ：深度マップの値をそのままzにする">従来</button>
         <button class="btn-ghost active" data-zmethod="hybrid" title="骨長短縮で大きさ・深度/生zで符号を決める新方式">ハイブリッド</button>
       </div>
-      <button id="calBtn" class="btn-ghost" style="margin-top:8px; width:100%">📐 キャリブレーション（Tポーズ3秒）</button>
+      <button id="calBtn" class="btn-ghost" style="margin-top:8px; width:100%">📐 キャリブレーション（3秒・T字/Y字/サボテン可）</button>
+      <div class="note" style="margin-top:6px">腕の各パーツが画面と平行になるポーズで。手まで画面内に入れると手アンカーも較正されます。</div>
       <pre id="calStatus" class="note" style="display:none; margin:8px 0 0; white-space:pre-line; font-family:inherit;"></pre>
     </div>
 
@@ -178,7 +193,14 @@
           <div class="head"><span>なめらかさ</span><span id="smoothVal">0.30</span></div>
           <input type="range" id="smooth" min="0.1" max="0.6" step="0.05" value="0.3" />
         </div>
-        <button id="resetView" class="btn-ghost">🎥 視点リセット</button>
+        <div class="row">
+          <button id="resetView" class="btn-ghost">🎥 視点リセット</button>
+          <button id="toggleSideView" class="btn-ghost" aria-pressed="false" title="前後(z)が正しく判定できているかを真横から目視確認する">↔️ 側面ビュー</button>
+        </div>
+        <div class="row" id="frontBackRow" title="手のワールドz位置が胸より前(緑)/中立(灰)/後ろ(赤)かをリアルタイム表示（±0.05m目安、__setFrontBackThreshで変更可）">
+          <span class="chip fb-chip neutral" id="fbChipL">左腕 <b id="fbLabelL">–</b></span>
+          <span class="chip fb-chip neutral" id="fbChipR">右腕 <b id="fbLabelR">–</b></span>
+        </div>
       </div>
     </div>
 
@@ -231,6 +253,11 @@
   const loadSampleBtn = document.getElementById("loadSample");
   const vrmFileInput = document.getElementById("vrmFile");
   const resetViewBtn = document.getElementById("resetView");
+  const toggleSideViewBtn = document.getElementById("toggleSideView");
+  const fbChipL = document.getElementById("fbChipL");
+  const fbChipR = document.getElementById("fbChipR");
+  const fbLabelL = document.getElementById("fbLabelL");
+  const fbLabelR = document.getElementById("fbLabelR");
   const smoothInput = document.getElementById("smooth");
   const smoothVal = document.getElementById("smoothVal");
   const tglPip = document.getElementById("tglPip");
@@ -251,6 +278,7 @@
   const zMethodBtns = [...document.querySelectorAll("[data-zmethod]")];
   const calBtn = document.getElementById("calBtn");
   const calStatusEl = document.getElementById("calStatus");
+  const CAL_BTN_LABEL_IDLE = "📐 キャリブレーション（3秒・T字/Y字/サボテン可）"; // g2タスク: ポーズ非依存化に伴いラベルを一般化
   const tglHandAnchor = document.getElementById("tglHandAnchor");
 
   // ===== 状態 =====
@@ -265,6 +293,9 @@
   window.__setWristMode = (m) => { WRIST_MODE = m; };
   let isVRM0 = false; // VRM0はrotateVRM0で180°回転するため腕の仰角(z)の符号が逆になる
   let DEPTH_REACH = true; // 前後(矢状面)近似トラッキングのON/OFF
+  // 前後角(矢状面)スケールと左右符号。SAG_L/SAG_Rは左右ボーンのミラー関係のみを表す値として維持し
+  // （__setSagで上書きされる互換対象はこの2値のみ）、VRM0/VRM1で異なる絶対方向の反転は
+  // animateVRM内のsagSgn(isVRM0依存、下記参照)で別途乗算する。
   let SAG_SCALE = 1.0, SAG_L = 1, SAG_R = -1; // 前後角スケールと左右符号（ヘッドレスで決定）
   window.__setDepth = (on) => { DEPTH_REACH = !!on; };
   window.__setSag = (l, r, s) => { SAG_L = l; SAG_R = r; if (s != null) SAG_SCALE = s; };
@@ -320,6 +351,10 @@
     ARM_SLERP_MIN: 0.25,
     SAG_DEADZONE: 0.14,      // 矢状角の不感帯[rad]
     SAG_MAX_RATE: 0.25,      // 矢状角のフレームあたり最大変化量[rad]
+    // 前後(z)確認UI(g1タスク)の判定閾値[m]。手ボーンのworld zが胸(chest)よりこの値を超えて
+    // +側(前方/カメラ寄り)なら「前」、-側なら「後」、それ未満なら「中立」とみなす。
+    // 0.05mはCONTRACT.mdの目安値どおり。__setFrontBackThreshで変更可能。
+    FRONTBACK_THRESH: 0.05,
   };
   window.__setOneEuro = (mincutoff, beta) => {
     ONE_EURO_MINCUTOFF = mincutoff; ONE_EURO_BETA = beta;
@@ -329,6 +364,7 @@
   window.__setFallbackThresh = (v) => { HZ.FALLBACK_THRESH = v; };
   window.__setFlipGate = (v) => { HZ.FLIP_ZMAG_THRESH = v; };
   window.__setSagLimits = (deadzone, maxRate) => { HZ.SAG_DEADZONE = deadzone; HZ.SAG_MAX_RATE = maxRate; };
+  window.__setFrontBackThresh = (v) => { HZ.FRONTBACK_THRESH = v; };
   // ヘッドレス検証用: visibilityゲートのヒステリシス閾値(enter/exit)を実行時調整する。
   // 引数省略(null/undefined)の側は変更しない。
   window.__setVisGate = (enterMin, exitMin) => {
@@ -865,15 +901,31 @@
     if (mUa) { L_ua = mUa; if (calStatus === "default") calStatus = "auto"; }
     if (mFa) { L_fa = mFa; if (calStatus === "default") calStatus = "auto"; }
   }
-  // 手動較正(Tポーズ3秒)専用のランニング最大2D長バッファ(画面平行性ゲート用)。
+  // 手動較正(3秒)専用のランニング最大2D長バッファ(画面平行性ゲート用)。
   // 自動較正(calBuf)とは独立させる：収集ウィンドウが3秒と短く、セッションをまたいで
   // 減衰させ続ける必要がないため毎回startManualCalibrationでゼロリセットする。
-  const manualCalBuf = { ua2d: 0, fa2d: 0 };
+  // g2タスク: キーをセグメント childIndex(13/14/15/16)単位に分離し左右を完全独立させた
+  // (旧実装は"ua2d"/"fa2d"のみ=左右の上腕(11-13/12-14)が同じランニング最大値を共有しており、
+  // 例えば左腕だけ画面平行・右腕が前傾しているケースで右腕の縮んだ2D長が左腕の大きい最大値と
+  // 比較され続けて恒久的に棄却される、逆に右腕の値で左腕が誤って基準化される、といった
+  // 左右混線の余地があった)。
+  const manualCalBuf = { ua_13: 0, ua_14: 0, fa_15: 0, fa_16: 0 };
+  function resetManualCalBuf() { for (const k of Object.keys(manualCalBuf)) manualCalBuf[k] = 0; }
+  // g2タスク: ポーズ非依存(T字/Y字/サボテン対応)の絶対的な平面性チェック。
+  // 既存の相対ゲート(CAL_NEAR_MAX_RATIO、そのセッション中のランニング最大2D長との比較)は
+  // 「セッション全体が前傾したまま」だと無力(全フレームが同程度に縮んでいればランニング最大自体も
+  // 縮んだまま合格してしまう)。MediaPipe world zでセグメント両端点の絶対的なz差を直接見ることで、
+  // ポーズの形(T字/Y字/上腕水平+前腕垂直のサボテン等)に依存せず「そのセグメントが画面とほぼ平行か」を
+  // 判定できる。閾値0.06m・visibility0.6の根拠はtest/sim/expectations.md §11参照。
+  let CAL_PLANAR_Z_THRESH = 0.06; // [m]
+  window.__setCalPlanarZThresh = (v) => { if (v > 0) CAL_PLANAR_Z_THRESH = v; };
+  let MANUAL_CAL_VIS_MIN = 0.6; // 手動較正専用のvisibility下限(自動較正のvisOk既定0.5より厳しい)
+  window.__setManualCalVisMin = (v) => { if (v > 0 && v <= 1) MANUAL_CAL_VIS_MIN = v; };
   function startManualCalibration() {
     manualCalActive = true; manualCalT0 = performance.now(); manualCalUA = []; manualCalFA = [];
     manualCalD09[15] = []; manualCalD09[16] = []; manualCalD517[15] = []; manualCalD517[16] = [];
     manualCalWm.length = 0; manualCalWn.length = 0;
-    manualCalBuf.ua2d = 0; manualCalBuf.fa2d = 0;
+    resetManualCalBuf();
     if (calBtn) { calBtn.textContent = "📐 収集中… 0%"; calBtn.disabled = true; }
   }
   // f1タスク: 自動較正(updateBoneCalibration)にはあった画面平行性ゲート(CAL_NEAR_MAX_RATIO、
@@ -882,14 +934,21 @@
   // 大きく前傾した腕の姿勢がそのまま「上腕/前腕長」として採用されてしまい(d2実測: 62%まで過小)、
   // 自動較正より悪化するという逆効果を生んでいた。同じCAL_NEAR_MAX_RATIO定数を流用することで
   // 自動/手動で判定基準を揃える(__setCalNearMaxRatioで両方に反映される)。
+  // g2タスク: 上記の相対ゲートに加え、絶対平面性チェック(CAL_PLANAR_Z_THRESH)とvisibility下限
+  // (MANUAL_CAL_VIS_MIN)をセグメント単位(左右・上腕/前腕をそれぞれ独立)で追加。これにより
+  // T字に限らずY字・サボテン等どのポーズでも「各セグメントが画面と平行なフレームだけ」を
+  // 拾えるようになり、片腕だけ較正が成立するケースにも対応する。
   function stepManualCalibration(world, lm2, lHand, rHand, vid, now) {
     if (!manualCalActive || !world) return;
     const elapsed = now - manualCalT0;
     for (const [aI, bI, key, arr] of [[11, 13, "ua", manualCalUA], [12, 14, "ua", manualCalUA], [13, 15, "fa", manualCalFA], [14, 16, "fa", manualCalFA]]) {
-      if (!visOk(world, aI) || !visOk(world, bI)) continue;
+      if (!visOk(world, aI, MANUAL_CAL_VIS_MIN) || !visOk(world, bI, MANUAL_CAL_VIS_MIN)) continue;
+      // 絶対平面性チェック: world zでの両端点差が閾値以上なら、そのセグメントは画面に対し
+      // 有意に前後方向へ傾いている(=foreshorteningでl3が過小になり得る)とみなして棄却する。
+      if (Math.abs(world[bI].z - world[aI].z) >= CAL_PLANAR_Z_THRESH) continue;
       const d2 = seg2DLen(lm2, aI, bI);
       if (d2 == null) continue;
-      const maxKey = key + "2d";
+      const maxKey = key + "_" + bI; // g2: 左右独立(childIndexキー化。従来は"ua2d"/"fa2d"で左右共有だった)
       if (d2 > manualCalBuf[maxKey]) manualCalBuf[maxKey] = d2;
       else if (manualCalBuf[maxKey] > 0 && d2 < manualCalBuf[maxKey] * CAL_NEAR_MAX_RATIO) continue; // 前後方向を向いている可能性→棄却
       const l3 = seg3DLenXY(world, aI, bI);
@@ -930,7 +989,7 @@
           hand: { d09_0: { 15: handCal.d09_0[15], 16: handCal.d09_0[16] }, d517_0: { 15: handCal.d517_0[15], 16: handCal.d517_0[16] }, W_m: handCal.W_m, w_n: handCal.w_n, D0: currentD0() },
         }));
       } catch (e) { /* 保存不可でも較正結果自体は継続利用 */ }
-      if (calBtn) { calBtn.textContent = "📐 キャリブレーション（Tポーズ3秒）"; calBtn.disabled = false; }
+      if (calBtn) { calBtn.textContent = CAL_BTN_LABEL_IDLE; calBtn.disabled = false; }
       recordCalResult({ mUa, mFa, md09L, md09R, md517L, md517R, mWm, mWn });
     }
   }
@@ -1442,10 +1501,10 @@
     manualCalD09[15].length = 0; manualCalD09[16].length = 0;
     manualCalD517[15].length = 0; manualCalD517[16].length = 0;
     manualCalWm.length = 0; manualCalWn.length = 0;
-    manualCalBuf.ua2d = 0; manualCalBuf.fa2d = 0; // 手動較正の画面平行性ゲート用ランニング最大値
+    resetManualCalBuf(); // 手動較正の画面平行性ゲート用ランニング最大値(左右・上腕/前腕別)
     calRefUa = null; calRefFa = null; // 自動較正ドリフトクランプの基準値スナップショットを再取得させる
     lastCalResult = null; renderCalStatus(null); // 較正結果フィードバック表示を消す
-    if (calBtn) { calBtn.textContent = "📐 キャリブレーション（Tポーズ3秒）"; calBtn.disabled = false; }
+    if (calBtn) { calBtn.textContent = CAL_BTN_LABEL_IDLE; calBtn.disabled = false; }
     // ハイブリッドZ：フィルタ・符号・基準点の実行時状態
     clearObj(shoulderZRef); clearObj(rawZLP); clearObj(lastFusedZ); clearObj(refEma);
     clearObj(oneEuroFilters); // 内部履歴のみ初期化。ONE_EURO_MINCUTOFF/BETA設定値自体は__setOneEuroの管轄なので不変
@@ -1532,8 +1591,20 @@
         // （幾何zは深度なしでも信頼できるためハイブリッドは常時対象。従来方式はavatar.html同様、深度なしでは適用しない）。
         const sagGateOn = DEPTH_REACH && (Z_METHOD === "hybrid" || (depthEnabled && !!latestDepth));
         if (sagGateOn) {
-          const rawL = SAG_L * armSagittal(src3d, 11, 13, true) * SAG_SCALE;
-          const rawR = SAG_R * armSagittal(src3d, 12, 14, false) * SAG_SCALE;
+          // VRM0/VRM1で前後(矢状面)の絶対方向が反転する問題の修正(g1タスク)。
+          // 実測(__boneWorldProbeでhandZ-chestZを測定): 同梱VRM0サンプルは既定のSAG_L=1/SAG_R=-1のままだと
+          // 前方リーチ(__simReach(60))で両腕ともhandZ-chestZ<0(=胸より奥/背中側)になり、実機報告どおり
+          // 背面へ腕が伸びるバグを再現した。SAG_L/SAG_Rを丸ごと反転(-1/+1相当)すると両腕ともhandZ-chestZ>0
+          // (=胸より前)に転じ理論どおりになることを確認したため、z成分の`sgn=isVRM0?1:-1`と同じ変数(isVRM0)
+          // で決まる符号をyにも適用する。ただしVRM0(sgn=1・無反転)とVRM1(sgn=-1・反転)の関係とは極性が逆
+          // (isVRM0=trueのときsagSgn=-1、isVRM0=falseのときsagSgn=1)である点に注意:
+          // これはzとyでKalidokitのEuler分解・three-vrmの正規化ボーン軸が異なる影響を受けるためで、
+          // 実測で確認できたのはVRM0(同梱サンプル)側のみ。VRM1側(sagSgn=1=現状維持)は実機VRM1モデルが
+          // 手元にないため未検証(z側の実装時と同じ前提を踏襲した推定)。想定外のVRM向けには従来どおり
+          // __setSag(l, r, s)で最終的な符号・スケールを直接上書きできる(SAG_L/SAG_Rはsgn適用後に乗算される)。
+          const sagSgn = isVRM0 ? -1 : 1;
+          const rawL = SAG_L * sagSgn * armSagittal(src3d, 11, 13, true) * SAG_SCALE;
+          const rawR = SAG_R * sagSgn * armSagittal(src3d, 12, 14, false) * SAG_SCALE;
           if (Z_METHOD === "hybrid") {
             // ハイブリッドのみスルーレート制限+不感帯を適用（従来方式はavatar.htmlと同じ生値を使う）
             if (rp.LeftUpperArm) rp.LeftUpperArm.y = updateSagAngle("L", rawL);
@@ -1815,7 +1886,22 @@
     return simFinalize(W);
   }
   window.__simCross = (deg) => { simResult = buildPoseCross(deg); };
-  window.__view = (deg) => { const r = (deg * Math.PI) / 180; camera.position.set(3 * Math.sin(r), 0.85, 3 * Math.cos(r)); controls.target.set(0, 0.85, 0); controls.update(); };
+  window.__view = (deg) => {
+    const r = (deg * Math.PI) / 180;
+    camera.position.set(3 * Math.sin(r), 0.85, 3 * Math.cos(r));
+    controls.target.set(0, 0.85, 0);
+    controls.update();
+    // 側面確認UI(g1タスク)向けの補助照明。key/fillは既定で正面(+Z)寄りに固定されており、
+    // 真横(90°付近)から見ると胴体の側面がほぼ逆光になり視認できないことを実測で確認した
+    // (key/fillを動かさない場合、側面ビューはスクリーンショット上でほぼ真っ暗になる)。
+    // 判定ロジック(resolveSign/armSagittal等)には一切関与しない見た目だけの調整で、
+    // 側面寄りの角度でのみkeyライトをほぼ真上+視点側へ動かし、正面(0°付近)では既定位置に戻す。
+    if (Math.abs(Math.sin(r)) > 0.5) {
+      key.position.set(3 * Math.sin(r), 8, 3 * Math.cos(r) + 1);
+    } else {
+      key.position.set(1, 1.6, 2.5); // 既定(正面)のkeyライト位置
+    }
+  };
   // 手の合成: 手首W中心に、指方向f・親指側sで21点を配置（画像正規化座標, +x右 +y下）
   function makeHand(W, f, s, sc) {
     const P = (ff, ss) => ({ x: W.x + ff * f.x * sc + ss * s.x * sc, y: W.y + ff * f.y * sc + ss * s.y * sc, z: (W.z || 0) + ff * f.z * sc + ss * s.z * sc, visibility: 1 });
@@ -1896,6 +1982,21 @@
     };
     return { left: dir("leftUpperArm", "leftLowerArm"), right: dir("rightUpperArm", "rightLowerArm") };
   };
+  // 読み取り専用(g1タスク): 指定ボーンのワールド座標{x,y,z}を返す。既定は前後反転バグの実証・
+  // 回帰ガードに使う6ボーン。挙動には一切影響しない(rigRotation/rigPosition等の書き込み経路は不使用)。
+  window.__boneWorldProbe = (names) => {
+    if (!currentVrm) return null;
+    const list = names && names.length ? names : ["leftHand", "rightHand", "leftLowerArm", "rightLowerArm", "chest", "hips"];
+    const out = {};
+    for (const n of list) {
+      const node = currentVrm.humanoid.getNormalizedBoneNode(n);
+      if (!node) { out[n] = null; continue; }
+      const p = new THREE.Vector3();
+      node.getWorldPosition(p);
+      out[n] = { x: p.x, y: p.y, z: p.z };
+    }
+    return out;
+  };
   // アバターの左手ボーンの実ワールド向きを数値で取得（目視に頼らず手首補正を決めるため）
   window.__handProbe = () => {
     if (!currentVrm) return null;
@@ -1935,6 +2036,27 @@
   const clock = new THREE.Clock();
   let fpsT0 = performance.now(), fpsFrames = 0;
 
+  // 前後(z)確認UI(g1タスク): 手ボーンのworld zが胸(chest)よりHZ.FRONTBACK_THRESH[m]を超えて
+  // +側(前方)なら緑「前」、-側なら赤「後」、それ未満なら灰「中立」を左右それぞれ表示する。
+  // __boneWorldProbe(読み取り専用フック)と同じデータを使うだけで判定ロジックには一切関与しない。
+  function updateFrontBackIndicator() {
+    if (!fbChipL || !currentVrm) return;
+    const bw = window.__boneWorldProbe(["leftHand", "rightHand", "chest"]);
+    if (!bw || !bw.chest) return;
+    const setChip = (p, chipEl, labelEl) => {
+      if (!p) { chipEl.classList.remove("fwd", "back"); chipEl.classList.add("neutral"); labelEl.textContent = "–"; return; }
+      const dz = p.z - bw.chest.z;
+      let cls = "neutral", label = "中立";
+      if (dz > HZ.FRONTBACK_THRESH) { cls = "fwd"; label = "前"; }
+      else if (dz < -HZ.FRONTBACK_THRESH) { cls = "back"; label = "後"; }
+      chipEl.classList.remove("fwd", "back", "neutral");
+      chipEl.classList.add(cls);
+      labelEl.textContent = label;
+    };
+    setChip(bw.leftHand, fbChipL, fbLabelL);
+    setChip(bw.rightHand, fbChipR, fbLabelR);
+  }
+
   function loop() {
     requestAnimationFrame(loop);
     const now = performance.now();
@@ -1957,6 +2079,7 @@
     }
 
     if (currentVrm) currentVrm.update(clock.getDelta()); // 毎フレーム必須（spring/lookAt/expression反映）
+    updateFrontBackIndicator();
     controls.update();
     renderer.render(scene, camera);
 
@@ -1990,6 +2113,19 @@
     camera.position.copy(DEFAULT_CAM);
     controls.target.copy(LOOK_AT);
     controls.update();
+    sideViewOn = false;
+    toggleSideViewBtn.classList.remove("active");
+    toggleSideViewBtn.setAttribute("aria-pressed", "false");
+  });
+  // 側面ビュー確認UI(g1タスク): 既存の__view()とOrbitControlsをそのまま利用し、
+  // 正面(0°)⇔真横(90°)をワンボタンで切り替える。前後(z)が正しいかを目視確認するための機能で、
+  // 判定ロジックには一切関与しない(__viewは表示用カメラ位置と補助照明を動かすだけ)。
+  let sideViewOn = false;
+  toggleSideViewBtn.addEventListener("click", () => {
+    sideViewOn = !sideViewOn;
+    window.__view(sideViewOn ? 90 : 0);
+    toggleSideViewBtn.classList.toggle("active", sideViewOn);
+    toggleSideViewBtn.setAttribute("aria-pressed", String(sideViewOn));
   });
   smoothInput.addEventListener("input", () => {
     SMOOTH = parseFloat(smoothInput.value);
