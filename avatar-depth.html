@@ -378,6 +378,9 @@
   let latestDepthRaw = null;       // out.predicted_depth を軽量化した {H,W,data}
   let latestDepthSampleLm2 = null; // レイテンシ補償: 深度推論開始時刻に最も近い2D座標スナップショット
   let lastFusedWorld = null;       // __zProbe 用に直近の融合済みworldを保持
+  // ヘッドレス検証用フェイク深度: (nx,ny)=>number|null を渡すと depthAvailable()/depthWindowValues() が
+  // 実深度AIの代わりにこれを参照する（未設定時は既存の実カメラ経路と完全に同一の分岐のまま）。
+  let fakeDepthFn = null;
   const poseRing = [];             // {t, lm2:{idx:{x,y}}} の直近10フレーム
   const POSE_RING_SIZE = 10;
   const REF_IDX = [0, 11, 12, 23, 24];
@@ -672,7 +675,13 @@
   }
   function clampInt(v, lo, hi) { return Math.min(hi, Math.max(lo, v)); }
   // predicted_depth から正規化座標(nx,ny)周辺 (2*win+1)^2 窓の値を配列で返す
+  // ヘッドレス検証用: fakeDepthFn が設定されていれば実深度AIをバイパスしてそれを使う（__setFakeDepth参照）。
+  // 未設定時（実カメラ経路の既定）は従来通り latestDepthRaw のみを参照する。
   function depthWindowValues(nx, ny, win) {
+    if (fakeDepthFn) {
+      const v = fakeDepthFn(nx, ny);
+      return (v == null) ? null : [v];
+    }
     if (!latestDepthRaw) return null;
     const { H, W, data } = latestDepthRaw;
     const px0 = Math.round(nx * W), py0 = Math.round(ny * H);
@@ -689,7 +698,12 @@
     const idx = clampInt(Math.round((p / 100) * (s.length - 1)), 0, s.length - 1);
     return s[idx];
   }
-  function depthAvailable() { return depthEnabled && !!latestDepthRaw; }
+  // fakeDepthFn 設定時はヘッドレス検証のために深度「利用可能」を偽装する（実カメラ経路は従来通りdepthEnabled&&latestDepthRawのみ）
+  function depthAvailable() { return !!fakeDepthFn || (depthEnabled && !!latestDepthRaw); }
+  // ヘッドレス検証用: 深度サンプリングのシームにテスト注入点を作る。fn: (nx,ny)=>number|null（正規化画像座標→
+  // 深度スコア。値が大きいほど「近い」側というresolveSignの符号規約(depthWindowValues経由でdAligned-refとして使われる)
+  // に合わせること）。null/未指定で解除（実カメラ経路の分岐に完全復帰）。
+  window.__setFakeDepth = (fn) => { fakeDepthFn = (typeof fn === "function") ? fn : null; };
 
   // ---- レイテンシ補償用リングバッファ（直近10フレームの2D座標） ----
   function pushPoseRing(t, lm2) {
@@ -715,7 +729,10 @@
   // 毎フレームのスケール/シフト変動（=ジッターの主因）を吸収する。
   function sampleRefDepthAligned(idx, lm2snap) {
     const p = lm2snap && lm2snap[idx];
-    if (!p || !latestDepthRaw) return null;
+    // fakeDepthFn使用時はlatestDepthRaw(実AI出力)が無くてもdepthWindowValues内でfakeDepthFnが
+    // 参照されるため、ここで早期returnしない(実カメラ経路はfakeDepthFn==nullなので従来通り)。
+    if (!p) return null;
+    if (!fakeDepthFn && !latestDepthRaw) return null;
     return percentileOf(depthWindowValues(p.x, p.y, 2), 50); // 中央値（生値、a,b適用前）
   }
   function updateScaleShiftFit(world, lm2snap, dt) {
@@ -756,7 +773,9 @@
   // 肘・手首の対象点：関節点＋セグメント内側点(t=0.25/0.5/0.75)の複数点から、
   // 近い側（逆深度で値が大きい側）の85パーセンタイルを採用（オクルージョン等の外れ値耐性）
   function sampleArmPointDepthAligned(idx, lm2snap) {
-    if (!latestDepthRaw || !lm2snap) return null;
+    // sampleRefDepthAlignedと同じ理由でfakeDepthFn使用時はlatestDepthRawの有無を問わない。
+    if (!lm2snap) return null;
+    if (!fakeDepthFn && !latestDepthRaw) return null;
     const parent = SEG_PARENT[idx];
     const pA = lm2snap[parent], pB = lm2snap[idx];
     if (!pA || !pB) return null;
@@ -1138,6 +1157,9 @@
 
     updateVisibilityWatchdog(world, now);
     updateBoneCalibration(world, lm2);
+    // ヘッドレス検証用: fakeDepthFn使用時はrunDepth()を経由しないため、resolveSign/updateScaleShiftFitが
+    // 参照するlatestDepthSampleLm2をこの場でposeRingから補う（実カメラ経路はfakeDepthFn==nullなので不変）。
+    if (fakeDepthFn) latestDepthSampleLm2 = nearestPoseRing(now) || latestDepthSampleLm2;
     updateScaleShiftFit(world, latestDepthSampleLm2 || lm2, dt);
 
     const rawZSnapshot = {};
@@ -1250,6 +1272,74 @@
     const factor = Math.max(HZ.ARM_SLERP_MIN, Math.min(1, v / HZ.VIS_GATE_MIN));
     return SMOOTH * factor;
   }
+
+  // ===== ヘッドレス検証用: 較正の決定論化フック =====
+  // オブジェクト(辞書)の中身だけを空にする小道具（変数自体は const のまま、参照は保つ）
+  function clearObj(o) { for (const k of Object.keys(o)) delete o[k]; }
+  // テスト前提のリセット：骨長較正・手アンカー較正・フィルタ/符号/矢状角などハイブリッドZの実行時状態・
+  // 明示キャリブレーションの進行状態・localStorage較正キー・フェイク深度注入を全て初期値へ戻す。
+  // シム経由のテストで「起動順序やlocalStorageの残留状態によって理論値が変わる」(testSurface.md §4-10)を防ぐ。
+  window.__resetCalibration = () => {
+    // 骨長較正（自動/手動共通の状態）
+    L_ua = 0.28; L_fa = 0.25; calStatus = "default";
+    calBuf.ua2d = 0; calBuf.fa2d = 0; calBuf.uaSamples.length = 0; calBuf.faSamples.length = 0;
+    // 手アンカー較正
+    handCal = { d09_0: { 15: null, 16: null }, d517_0: { 15: null, 16: null }, W_m: null, w_n: null };
+    handCalStatus = "default";
+    handCalBuf.d09Samples[15].length = 0; handCalBuf.d09Samples[16].length = 0;
+    handCalBuf.d517Samples[15].length = 0; handCalBuf.d517Samples[16].length = 0;
+    handCalBuf.wmSamples.length = 0; handCalBuf.wnSamples.length = 0;
+    // 明示キャリブレーション（Tポーズ3秒収集）の進行状態
+    manualCalActive = false; manualCalT0 = 0; manualCalUA = []; manualCalFA = [];
+    manualCalD09[15].length = 0; manualCalD09[16].length = 0;
+    manualCalD517[15].length = 0; manualCalD517[16].length = 0;
+    manualCalWm.length = 0; manualCalWn.length = 0;
+    if (calBtn) { calBtn.textContent = "📐 キャリブレーション（Tポーズ3秒）"; calBtn.disabled = false; }
+    // ハイブリッドZ：フィルタ・符号・基準点の実行時状態
+    clearObj(shoulderZRef); clearObj(rawZLP); clearObj(lastFusedZ); clearObj(refEma);
+    clearObj(oneEuroFilters); // 内部履歴のみ初期化。ONE_EURO_MINCUTOFF/BETA設定値自体は__setOneEuroの管轄なので不変
+    clearObj(lastFusedAxis);
+    clearObj(depthEma); // legacy z方式のEMA状態（ハイブリッド既定では未使用だが念のため）
+    for (const idx of [13, 14, 15, 16]) { signState[idx].sign = 1; signState[idx].init = false; }
+    scaleFit = { a: 1, b: 0, initialized: false };
+    visUnavailableSince = null; visGateDisabled = false;
+    lastFuseT = null;
+    lastFusedWorld = null;
+    poseRing.length = 0;
+    sagAngle.L = 0; sagAngle.R = 0;
+    // 手アンカー：スイベル・ブレンド重み・手首回転強度・直近有効値・直近マッチ
+    for (const side of [15, 16]) { HA_DBG[side] = { w: 0, r: null, dz: null, elbowDeg: null, matched: false }; wristRotBlend[side] = 0; swivelState[side] = null; lastValidAnchor[side] = null; }
+    lastHandMatch = { 15: null, 16: null };
+    // 深度AI（実/フェイク）状態：フェイク深度注入も解除し実カメラ経路の既定分岐に戻す
+    latestDepthRaw = null; latestDepthSampleLm2 = null; latestDepth = null; depthEnabled = false;
+    fakeDepthFn = null;
+    // localStorageの永続化較正値（次回ロード時の非決定性の根）
+    try { localStorage.removeItem(CAL_KEY); } catch (e) {}
+    try { localStorage.removeItem(CAL_KEY_V1); } catch (e) {}
+  };
+  // テスト用：骨長を直接指定し自動較正を停止する（manual固定・localStorageへは保存しない）
+  window.__setManualCal = (uaLen, faLen) => {
+    if (uaLen > 0) L_ua = uaLen;
+    if (faLen > 0) L_fa = faLen;
+    calStatus = "manual";
+  };
+  // テスト用：handCal相当のフィールドを直接注入し較正済み(manual)状態にする。
+  // 形は実装中のhandCal構造(d09_0/d517_0はwrist idx 15/16をキーとする左右別値、W_m/w_nは肩幅の較正値)に合わせる。
+  // 例: __setHandCal({ d09_0: {15: 0.10, 16: 0.10}, d517_0: {15: 0.045, 16: 0.045}, W_m: 0.36, w_n: 0.18 })
+  window.__setHandCal = (cal) => {
+    if (!cal) return;
+    if (cal.d09_0) {
+      if (cal.d09_0[15] != null) handCal.d09_0[15] = cal.d09_0[15];
+      if (cal.d09_0[16] != null) handCal.d09_0[16] = cal.d09_0[16];
+    }
+    if (cal.d517_0) {
+      if (cal.d517_0[15] != null) handCal.d517_0[15] = cal.d517_0[15];
+      if (cal.d517_0[16] != null) handCal.d517_0[16] = cal.d517_0[16];
+    }
+    if (cal.W_m != null) handCal.W_m = cal.W_m;
+    if (cal.w_n != null) handCal.w_n = cal.w_n;
+    handCalStatus = "manual";
+  };
 
   function animateVRM(r, vid) {
     if (!currentVrm || !r) return;
@@ -1439,7 +1529,8 @@
   }
 
   // ===== シミュレーション（カメラ不要で「ランドマーク→アバター」だけを検証）=====
-  // MediaPipe world 規約: +X=画像右, +Y=下, +Z=手前, 原点=腰中央, 単位=メートル
+  // MediaPipe world 規約: +X=画像右, +Y=下, -Z=手前(カメラ寄り)/+Z=奥, 原点=腰中央, 単位=メートル
+  // （旧コメントは「+Z=手前」の誤記だった。resolveSign/armSagittal/buildPoseReach等の実装は一貫して-Z=手前）
   function buildPose(name) {
     const W = {
       0: [0, -0.62, 0], 11: [0.18, -0.45, 0], 12: [-0.18, -0.45, 0],
@@ -1492,6 +1583,78 @@
     return { poseLandmarks: [lm2], poseWorldLandmarks: [world], leftHandLandmarks: [], rightHandLandmarks: [], faceLandmarks: [] };
   }
   window.__simReach = (deg) => { simResult = buildPoseReach(deg); };
+  // ---- s2-hooks 追加ビルダー: 左右非対称・方位角+仰角の複合・交差リーチ(testSurface.md §4-1,4-5の穴埋め) ----
+  // 共通ヘルパー：既存4ビルダーと同じ胴体/脚の固定座標（肩11/12・腰23/24・膝25/26・足首27/28・鼻0）
+  function simBaseTorsoLegs() {
+    return {
+      0: [0, -0.62, 0], 11: [0.18, -0.45, 0], 12: [-0.18, -0.45, 0],
+      23: [0.10, 0, 0], 24: [-0.10, 0, 0], 25: [0.10, 0.45, 0], 26: [-0.10, 0.45, 0], 27: [0.10, 0.9, 0], 28: [-0.10, 0.9, 0],
+    };
+  }
+  // 共通ヘルパー：W(idx->[x,y,z])を既存ビルダーと同じ5フィールドshapeへ変換
+  // （lm2は既存の単純アフィン投影 x:0.5+wx*0.6, y:0.55+wy*0.45 を踏襲、avatar-depth.html:1458相当）
+  function simFinalize(W) {
+    const world = []; for (let i = 0; i < 33; i++) { const p = W[i] || [0, -0.3, 0]; world.push({ x: p[0], y: p[1], z: p[2], visibility: 1 }); }
+    const lm2 = world.map((p) => ({ x: clamp(0.5 + p.x * 0.6, 0, 1), y: clamp(0.55 + p.y * 0.45, 0, 1), z: p.z, visibility: 1 }));
+    return { poseLandmarks: [lm2], poseWorldLandmarks: [world], leftHandLandmarks: [], rightHandLandmarks: [], faceLandmarks: [] };
+  }
+  // 左右独立の矢状面リーチ: degX=0でTポーズ位置、90で真正面(buildPoseReachの片腕版)。
+  // degX=nullならその腕は"down"姿勢(buildPoseのdown座標をそのまま使用)。
+  function buildPoseReachLR(degL, degR) {
+    const U = 0.27, F = 0.25;
+    const W = simBaseTorsoLegs();
+    if (degL == null) { W[13] = [0.20, -0.22, 0]; W[15] = [0.22, 0.02, 0]; }
+    else {
+      const r = (degL * Math.PI) / 180, c = Math.cos(r), s = Math.sin(r);
+      W[13] = [0.18 + U * c, -0.45, -U * s]; W[15] = [W[13][0] + F * c, -0.45, W[13][2] - F * s];
+    }
+    if (degR == null) { W[14] = [-0.20, -0.22, 0]; W[16] = [-0.22, 0.02, 0]; }
+    else {
+      const r = (degR * Math.PI) / 180, c = Math.cos(r), s = Math.sin(r);
+      W[14] = [-0.18 - U * c, -0.45, -U * s]; W[16] = [W[14][0] - F * c, -0.45, W[14][2] - F * s];
+    }
+    return simFinalize(W);
+  }
+  window.__simReachLR = (degL, degR) => { simResult = buildPoseReachLR(degL, degR); };
+  // 方位角(azimDeg: 0=真横→90=真正面。buildPoseReachと同じ規約)+仰角(elevDeg: -90..90。buildPoseElevと
+  // 同じ規約)の複合リーチ。肘は伸ばした一直線＝単位方向ベクトルdirにU/Fを掛けるだけなのでdx²+dy²+dz²=U²/F²
+  // を厳密に保つ。azim=0またはelev=0はそれぞれbuildPoseElev/buildPoseReachの計算と一致する特別な場合になる
+  // （検算: az=0,el=0→(1,0,0)=Tポーズ方向、az=90,el=0→(0,0,-1)=真正面、az=0,el=90→(0,-1,0)=真上）。
+  function reach3DDir(azimDeg, elevDeg, leftSide) {
+    const az = (azimDeg * Math.PI) / 180, el = (elevDeg * Math.PI) / 180;
+    const cz = Math.cos(el), outward = cz * Math.cos(az);
+    return { x: leftSide ? outward : -outward, y: -Math.sin(el), z: -cz * Math.sin(az) };
+  }
+  function buildPoseReach3D(azimDeg, elevDeg, side) {
+    const U = 0.27, F = 0.25;
+    const W = simBaseTorsoLegs();
+    const doLeft = side !== "right", doRight = side !== "left"; // 省略時("both"含む)は両腕
+    if (doLeft) {
+      const d = reach3DDir(azimDeg, elevDeg, true);
+      W[13] = [0.18 + U * d.x, -0.45 + U * d.y, U * d.z];
+      W[15] = [W[13][0] + F * d.x, W[13][1] + F * d.y, W[13][2] + F * d.z];
+    } else { W[13] = [0.20, -0.22, 0]; W[15] = [0.22, 0.02, 0]; } // 反対側は"down"姿勢
+    if (doRight) {
+      const d = reach3DDir(azimDeg, elevDeg, false);
+      W[14] = [-0.18 + U * d.x, -0.45 + U * d.y, U * d.z];
+      W[16] = [W[14][0] + F * d.x, W[14][1] + F * d.y, W[14][2] + F * d.z];
+    } else { W[14] = [-0.20, -0.22, 0]; W[16] = [-0.22, 0.02, 0]; }
+    return simFinalize(W);
+  }
+  window.__simReach3D = (azimDeg, elevDeg, side) => { simResult = buildPoseReach3D(azimDeg, elevDeg, side); };
+  // 左腕が体の正中線を越えて右前方へ交差するリーチ。真正面(buildPoseReachのreachDeg=90相当)から
+  // さらに同じ回転方向へdeg分振り切ることで交差を表現する(theta=90+deg、deg=交差の深さ0..60目安)。
+  // theta>90になるとcos(theta)<0＝肘/手首のxが対側(負)に転じ、sin(theta)>0が保たれる限りzは負(前)のまま。
+  // 右腕は常に"down"姿勢。
+  function buildPoseCross(deg) {
+    const U = 0.27, F = 0.25;
+    const W = simBaseTorsoLegs();
+    const theta = ((90 + deg) * Math.PI) / 180, c = Math.cos(theta), s = Math.sin(theta);
+    W[13] = [0.18 + U * c, -0.45, -U * s]; W[15] = [W[13][0] + F * c, -0.45, W[13][2] - F * s];
+    W[14] = [-0.20, -0.22, 0]; W[16] = [-0.22, 0.02, 0];
+    return simFinalize(W);
+  }
+  window.__simCross = (deg) => { simResult = buildPoseCross(deg); };
   window.__view = (deg) => { const r = (deg * Math.PI) / 180; camera.position.set(3 * Math.sin(r), 0.85, 3 * Math.cos(r)); controls.target.set(0, 0.85, 0); controls.update(); };
   // 手の合成: 手首W中心に、指方向f・親指側sで21点を配置（画像正規化座標, +x右 +y下）
   function makeHand(W, f, s, sc) {
@@ -1527,6 +1690,38 @@
     base.leftHandLandmarks = [makeHand({ x: lw.x, y: lw.y, z: 0 }, f, s, 0.12 * (handScale || 1))];
     simResult = base;
     return base;
+  };
+  // __simReachHandの両手版: 左右独立リーチ(buildPoseReachLR)+両手ランドマークを付与し、
+  // matchHandsToWristsの2手同時マッチングを踏む。右手はf(指方向)は同一、s(親指側方向)のxを反転した
+  // ミラーで生成する（左右の手が体の中心線に対して鏡像になるように）。reachDeg=nullならその側は
+  // "down"姿勢のままハンドランドマークだけ手首位置に追加する。
+  window.__simReachHand2 = (reachDegL, handScaleL, reachDegR, handScaleR) => {
+    const base = buildPoseReachLR(reachDegL, reachDegR);
+    const lw = base.poseLandmarks[0][15], rw = base.poseLandmarks[0][16];
+    const f = { x: 0, y: 0, z: -1 };
+    const sL = { x: -1, y: 0, z: 0 }, sR = { x: 1, y: 0, z: 0 }; // 右手はsのxを反転(ミラー)
+    base.leftHandLandmarks = [makeHand({ x: lw.x, y: lw.y, z: 0 }, f, sL, 0.12 * (handScaleL || 1))];
+    base.rightHandLandmarks = [makeHand({ x: rw.x, y: rw.y, z: 0 }, f, sR, 0.12 * (handScaleR || 1))];
+    simResult = base;
+    return base;
+  };
+  // 既存/新規ポーズにvisibility上書きを合成する。baseNameの語彙: "down"|"up"|"tpose"|"leftup"(既存4ポーズ)、
+  // "reach<deg>"（buildPoseReach(deg)。例"reach45"が最低限要求されている相当、任意の数値degに対応）。
+  // 例: __simVis("reach45", {13:0.2, 15:0.1}) — reach45ポーズの左肘(13)・左手首(15)のvisibilityだけ下げる。
+  // visMapに無いindexは元のvisibility(常に1)のまま。未知のbaseNameはconsole.warnしてsimResultを変更しない。
+  function simVisBase(baseName) {
+    if (baseName === "down" || baseName === "up" || baseName === "tpose" || baseName === "leftup") return buildPose(baseName);
+    const m = /^reach(-?\d+(?:\.\d+)?)$/.exec(String(baseName));
+    if (m) return buildPoseReach(parseFloat(m[1]));
+    return null;
+  }
+  window.__simVis = (baseName, visMap) => {
+    const base = simVisBase(baseName);
+    if (!base) { console.warn("__simVis: unknown baseName", baseName); return null; }
+    const applyVis = (arr) => arr[0].map((p, i) => ({ x: p.x, y: p.y, z: p.z, visibility: (visMap && visMap[i] != null) ? visMap[i] : p.visibility }));
+    const out = { ...base, poseWorldLandmarks: [applyVis(base.poseWorldLandmarks)], poseLandmarks: [applyVis(base.poseLandmarks)] };
+    simResult = out;
+    return out;
   };
   // 上腕の向き(world)を数値取得。前方リーチなら z<0（カメラ方向 -Z）になるはず
   window.__armProbe = () => {
