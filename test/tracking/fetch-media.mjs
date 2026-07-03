@@ -2,12 +2,24 @@
 // test/tracking/fetch-media.mjs
 //
 // テスト用映像の取得と変換(冪等: 既存ファイルはスキップ)。
-//   media/src.mp4  — Pexelsからのダウンロード原本
-//   media/clip.mp4 — 1280x720・8〜10秒にトリム/スケールした比較用クリップ
-//   media/clip.y4m — 同クリップのY4M(ヘッダ C420mpeg2→C420 修正済み)
+// 複数メディアセットをマニフェスト形式(MEDIA_MANIFEST)で扱う。
+//
+//   [clip セット] 従来どおりの基準クリップ(正面向き・全身・腕の可動が大きい)
+//     media/src.mp4  — Pexelsからのダウンロード原本
+//     media/clip.mp4 — 1280x720・8〜10秒にトリム/スケールした比較用クリップ
+//     media/clip.y4m — 同クリップのY4M(ヘッダ C420mpeg2→C420 修正済み)
+//     media/clip.meta.json
+//
+//   [punch セット] 正面向きパンチ/シャドーボクシング(拳がカメラ方向へ伸びる区間を含む)
+//     media/punch-src.mp4 — Pexelsからのダウンロード原本
+//     media/punch.mp4     — 1280x720・8〜12秒にトリムしたパンチクリップ
+//     media/punch.y4m     — 同クリップのY4M(ヘッダ修正済み)
+//     media/punch.meta.json — 元URL/尺/fps/パンチストロークのおおよその時刻(notes)
 //
 // 実行: node test/tracking/fetch-media.mjs
 // 各生成物は既に存在し、かつ最低限のサイズ/整合性チェックを満たす場合はスキップする。
+// マニフェストに新しいセットを追加すれば、同じパイプライン(ダウンロード→トリム/スケール→Y4M化→meta書き出し)
+// が自動的に適用される。
 
 import fs from "node:fs";
 import fsp from "node:fs/promises";
@@ -20,19 +32,15 @@ import ffmpegPath from "ffmpeg-static";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const MEDIA_DIR = path.join(__dirname, "media");
-const SRC_MP4 = path.join(MEDIA_DIR, "src.mp4");
-const CLIP_MP4 = path.join(MEDIA_DIR, "clip.mp4");
-const CLIP_Y4M = path.join(MEDIA_DIR, "clip.y4m");
-const SRC_META = path.join(MEDIA_DIR, "src.meta.json");
-const CLIP_META = path.join(MEDIA_DIR, "clip.meta.json"); // run.mjsが実尺(待機時間の算出)に使う
 
-// clip.mp4 / clip.y4m の目標仕様(CONTRACT.md: 1280x720, 8〜10秒)
-const TARGET_W = 1280;
-const TARGET_H = 720;
-const TARGET_DURATION_SEC = 9; // 8〜10秒レンジの中央値
-const TARGET_FPS = 30;
+const PEXELS_LICENSE =
+  "Pexels License (商用可・改変可・帰属表示不要) https://www.pexels.com/license/";
 
-// 採用動画: 正面向き・全身・単独人物・腕の可動が大きい(ジャンピングジャック)。
+// ---------------------------------------------------------------------------
+// 採用動画candidates
+// ---------------------------------------------------------------------------
+
+// [clip セット] 正面向き・全身・単独人物・腕の可動が大きい(ジャンピングジャック)。
 // 調査手順は understand/research.md および本エージェントのPexels探索(WebFetch)による。
 // 屋外公園、単独人物、正面カメラ、2560x1440(16:9)@29.97fps、ネイティブ長 6.47秒
 // (目標尺に満たないため clip 生成時に ffmpeg -stream_loop でループ延長する)。
@@ -40,8 +48,7 @@ const PRIMARY_VIDEO = {
   url: "https://videos.pexels.com/video-files/4764177/4764177-uhd_2560_1440_30fps.mp4",
   page: "https://www.pexels.com/video/video-of-woman-doing-jumping-jacks-4764177/",
   author: "Gustavo Fring",
-  license:
-    "Pexels License (商用可・改変可・帰属表示不要) https://www.pexels.com/license/",
+  license: PEXELS_LICENSE,
   note: "正面向き・全身・単独人物のジャンピングジャック(屋外公園)。2560x1440 @29.97fps, ネイティブ長約6.47秒",
 };
 
@@ -50,10 +57,90 @@ const FALLBACK_VIDEO = {
   url: "https://videos.pexels.com/video-files/4754030/4754030-uhd_2732_1440_25fps.mp4",
   page: "https://www.pexels.com/video/a-woman-doing-push-ups-on-a-boxing-ring-4754030/",
   author: "unknown (フォールバック、research.mdの生存確認済みURLを使用)",
-  license:
-    "Pexels License (商用可・改変可・帰属表示不要) https://www.pexels.com/license/",
+  license: PEXELS_LICENSE,
   note: "フォールバック: 腕立て伏せ・横向き。2732x1440 @25fps",
 };
+
+// [punch セット] シャドーボクシング。全身/腰上が写り、ジャブ/ストレートがカメラ方向へ
+// 伸びるストロークが複数回入っている。屋内ジム、単独人物、1920x1080@25fps、ネイティブ長12.08秒。
+// 探索過程(WebSearch/WebFetch、m1担当エージェントによる目視フレーム確認)の詳細・却下した候補は
+// 本ファイルを消費するタスクの報告に記載。完全な正対(カメラが打撃線の真正面)の映像はPexels上で
+// 見つからず、打撃線に対しおよそ20〜30度オフセットした構図を採用(CONTRACT.md ｍ1タスクの
+// フォールバック方針「正対でなくても腕がカメラ方向へ伸びる動作を含む最善の代替」に基づく)。
+const PUNCH_VIDEO = {
+  url: "https://videos.pexels.com/video-files/10988078/10988078-hd_1920_1080_25fps.mp4",
+  page: "https://www.pexels.com/video/man-shadowboxing-in-gym-10988078/",
+  author: "gusat silviu (modus-vivendi)",
+  license: PEXELS_LICENSE,
+  note:
+    "屋内ジムでのシャドーボクシング(全身/腰上、単独人物)。1920x1080 @25fps、ネイティブ長12.08秒。" +
+    "ジャブ/ストレートがカメラ方向(打撃線に対し約20〜30度オフセット)へ伸びるストロークが" +
+    "約1.3s/4.1s/5.1s/6.4sの4回入っている(6.4sが最も正対に近い最大伸展)。他に0.8s/9.0s付近にも" +
+    "小さい伸展あり(punch.mp4を5fpsでコンタクトシート化して目視確認・確定)。" +
+    "照明はやや暗め(青系リムライト)だが人物のシルエット・四肢は判別可能。",
+};
+
+// フォールバック候補(生存確認済み): カメラにより近い距離でジャブがレンズ方向へ伸びる場面を含むが、
+// 胸から上のクローズアップで下半身は写らない。プライマリがダウンロード不能な場合のみ使用。
+const PUNCH_VIDEO_FALLBACK = {
+  url: "https://videos.pexels.com/video-files/9943633/9943633-uhd_2560_1440_24fps.mp4",
+  page: "https://www.pexels.com/video/a-man-throwing-punches-in-the-air-9943633/",
+  author: "KoolShooters",
+  license: PEXELS_LICENSE,
+  note:
+    "フォールバック: 胸から上のクローズアップ、暗め照明、低アングル。2560x1440 @24fps、ネイティブ長10.71秒。" +
+    "拳がレンズへ直接伸びる瞬間を複数含むが全身/腰上の要件は完全には満たさない。",
+};
+
+// ---------------------------------------------------------------------------
+// メディアセット・マニフェスト
+// ---------------------------------------------------------------------------
+// 各セットは「ダウンロード原本 → トリム/スケール済みmp4 → Y4M化 → meta.json書き出し」という
+// 同一パイプラインを通る。新しいメディアが必要になったら配列に要素を追加するだけでよい。
+
+const MEDIA_MANIFEST = [
+  {
+    key: "clip",
+    srcMp4: path.join(MEDIA_DIR, "src.mp4"),
+    srcMeta: path.join(MEDIA_DIR, "src.meta.json"),
+    clipMp4: path.join(MEDIA_DIR, "clip.mp4"),
+    clipY4m: path.join(MEDIA_DIR, "clip.y4m"),
+    clipMeta: path.join(MEDIA_DIR, "clip.meta.json"),
+    // CONTRACT.md: 1280x720, 8〜10秒(中央値9秒)
+    targetW: 1280,
+    targetH: 720,
+    targetDurationSec: 9,
+    targetFps: 30,
+    minSrcBytes: 100_000,
+    minClipBytes: 100_000,
+    minY4mBytes: 1_000_000,
+    candidates: [PRIMARY_VIDEO, FALLBACK_VIDEO],
+    notes: null,
+  },
+  {
+    key: "punch",
+    srcMp4: path.join(MEDIA_DIR, "punch-src.mp4"),
+    srcMeta: path.join(MEDIA_DIR, "punch-src.meta.json"),
+    clipMp4: path.join(MEDIA_DIR, "punch.mp4"),
+    clipY4m: path.join(MEDIA_DIR, "punch.y4m"),
+    clipMeta: path.join(MEDIA_DIR, "punch.meta.json"),
+    // 8〜12秒レンジ。原本(12.08秒)中の5回のパンチストローク(最終約10.3s)を余裕を持って収める
+    targetW: 1280,
+    targetH: 720,
+    targetDurationSec: 11,
+    targetFps: 25,
+    minSrcBytes: 100_000,
+    minClipBytes: 100_000,
+    minY4mBytes: 1_000_000,
+    candidates: [PUNCH_VIDEO, PUNCH_VIDEO_FALLBACK],
+    notes:
+      "パンチストローク(ジャブ/ストレートがカメラ方向へ伸びる瞬間)のおおよその時刻(punch.mp4内、" +
+      "trimStart=0のため原本と同一): 約1.3s, 4.1s, 5.1s, 6.4s(6.4sが最も伸展が大きく正対に近い)。" +
+      "他に0.8s, 9.0s付近にも小さい伸展あり。punch.mp4を5fps/0.2秒刻みのコンタクトシートにして" +
+      "目視確認済み。カメラは打撃線に対し約20〜30度オフセットしており、厳密な正対ではない" +
+      "(採用理由・却下した候補はfetch-media.mjs冒頭のコメントおよびタスク報告を参照)。",
+  },
+];
 
 function log(...args) {
   console.log("[fetch-media]", ...args);
@@ -166,72 +253,6 @@ async function probeResolution(file) {
   }
 }
 
-async function ensureSrcVideo() {
-  if (fileExistsNonEmpty(SRC_MP4, 100_000)) {
-    log(`skip: ${SRC_MP4} already exists (${fs.statSync(SRC_MP4).size} bytes)`);
-    if (fileExistsNonEmpty(SRC_META, 10)) {
-      return JSON.parse(fs.readFileSync(SRC_META, "utf8"));
-    }
-    return { url: "(既存ファイル、由来不明)", note: "既存src.mp4を再利用" };
-  }
-
-  await fsp.mkdir(MEDIA_DIR, { recursive: true });
-
-  for (const candidate of [PRIMARY_VIDEO, FALLBACK_VIDEO]) {
-    log(`downloading candidate: ${candidate.url}`);
-    try {
-      const { bytes, contentType } = await downloadFile(candidate.url, SRC_MP4);
-      if (bytes < 100_000 || !/video|octet-stream/.test(contentType)) {
-        throw new Error(
-          `suspicious download (bytes=${bytes}, contentType=${contentType})`
-        );
-      }
-      log(`downloaded ${bytes} bytes, content-type=${contentType}`);
-      fs.writeFileSync(SRC_META, JSON.stringify(candidate, null, 2));
-      return candidate;
-    } catch (err) {
-      log(`candidate failed: ${candidate.url} -> ${err.message}`);
-      try {
-        fs.unlinkSync(SRC_MP4);
-      } catch {}
-    }
-  }
-  throw new Error("all video candidates failed to download");
-}
-
-async function ensureClipMp4() {
-  if (fileExistsNonEmpty(CLIP_MP4, 100_000)) {
-    log(`skip: ${CLIP_MP4} already exists (${fs.statSync(CLIP_MP4).size} bytes)`);
-    return;
-  }
-  const srcDuration = await probeDurationSec(SRC_MP4);
-  log(`src.mp4 duration = ${srcDuration.toFixed(2)}s`);
-
-  // 目標尺に届かない場合は -stream_loop で必要な回数だけ延長してからトリム
-  const loops = Math.max(0, Math.ceil(TARGET_DURATION_SEC / srcDuration) - 1);
-  log(`stream_loop=${loops} (target=${TARGET_DURATION_SEC}s)`);
-
-  const args = [
-    "-y",
-    ...(loops > 0 ? ["-stream_loop", String(loops)] : []),
-    "-i",
-    SRC_MP4,
-    "-t",
-    String(TARGET_DURATION_SEC),
-    "-vf",
-    `scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=increase,crop=${TARGET_W}:${TARGET_H}`,
-    "-r",
-    String(TARGET_FPS),
-    "-an",
-    "-pix_fmt",
-    "yuv420p",
-    CLIP_MP4,
-  ];
-  log(`ffmpeg ${args.join(" ")}`);
-  await run(ffmpegPath, args);
-  log(`generated ${CLIP_MP4}`);
-}
-
 // ffmpegが出力するY4Mヘッダの "C420mpeg2" は Chromium の file_video_capture_device が
 // 受け付けない(サポートは "C420" のみ)。ヘッダ行(先頭1行、FRAME区切り前)だけをテキスト
 // 置換し、以降のバイナリフレームデータはストリームでそのままコピーする
@@ -277,56 +298,148 @@ async function patchY4mHeader(rawPath, finalPath) {
   }
 }
 
-async function ensureClipY4m() {
-  if (fileExistsNonEmpty(CLIP_Y4M, 1_000_000)) {
-    log(`skip: ${CLIP_Y4M} already exists (${fs.statSync(CLIP_Y4M).size} bytes)`);
+// ---------------------------------------------------------------------------
+// セット単位の汎用パイプライン(clip/punch共通)
+// ---------------------------------------------------------------------------
+
+async function ensureSrcVideo(set) {
+  if (fileExistsNonEmpty(set.srcMp4, set.minSrcBytes)) {
+    log(`skip: ${set.srcMp4} already exists (${fs.statSync(set.srcMp4).size} bytes)`);
+    if (fileExistsNonEmpty(set.srcMeta, 10)) {
+      return JSON.parse(fs.readFileSync(set.srcMeta, "utf8"));
+    }
+    return { url: "(既存ファイル、由来不明)", note: "既存srcを再利用" };
+  }
+
+  await fsp.mkdir(MEDIA_DIR, { recursive: true });
+
+  for (const candidate of set.candidates) {
+    log(`[${set.key}] downloading candidate: ${candidate.url}`);
+    try {
+      const { bytes, contentType } = await downloadFile(candidate.url, set.srcMp4);
+      if (bytes < set.minSrcBytes || !/video|octet-stream/.test(contentType)) {
+        throw new Error(
+          `suspicious download (bytes=${bytes}, contentType=${contentType})`
+        );
+      }
+      log(`[${set.key}] downloaded ${bytes} bytes, content-type=${contentType}`);
+      fs.writeFileSync(set.srcMeta, JSON.stringify(candidate, null, 2));
+      return candidate;
+    } catch (err) {
+      log(`[${set.key}] candidate failed: ${candidate.url} -> ${err.message}`);
+      try {
+        fs.unlinkSync(set.srcMp4);
+      } catch {}
+    }
+  }
+  throw new Error(`[${set.key}] all video candidates failed to download`);
+}
+
+async function ensureClipMp4(set) {
+  if (fileExistsNonEmpty(set.clipMp4, set.minClipBytes)) {
+    log(`skip: ${set.clipMp4} already exists (${fs.statSync(set.clipMp4).size} bytes)`);
     return;
   }
-  const rawY4m = path.join(MEDIA_DIR, "_clip.raw.y4m");
-  const args = ["-y", "-i", CLIP_MP4, "-pix_fmt", "yuv420p", rawY4m];
-  log(`ffmpeg ${args.join(" ")}`);
+  const srcDuration = await probeDurationSec(set.srcMp4);
+  log(`[${set.key}] src duration = ${srcDuration.toFixed(2)}s`);
+
+  // 目標尺に届かない場合は -stream_loop で必要な回数だけ延長してからトリム
+  const loops = Math.max(0, Math.ceil(set.targetDurationSec / srcDuration) - 1);
+  log(`[${set.key}] stream_loop=${loops} (target=${set.targetDurationSec}s)`);
+
+  const args = [
+    "-y",
+    ...(loops > 0 ? ["-stream_loop", String(loops)] : []),
+    "-i",
+    set.srcMp4,
+    "-t",
+    String(set.targetDurationSec),
+    "-vf",
+    `scale=${set.targetW}:${set.targetH}:force_original_aspect_ratio=increase,crop=${set.targetW}:${set.targetH}`,
+    "-r",
+    String(set.targetFps),
+    "-an",
+    "-pix_fmt",
+    "yuv420p",
+    set.clipMp4,
+  ];
+  log(`[${set.key}] ffmpeg ${args.join(" ")}`);
   await run(ffmpegPath, args);
-  await patchY4mHeader(rawY4m, CLIP_Y4M);
+  log(`[${set.key}] generated ${set.clipMp4}`);
+}
+
+async function ensureClipY4m(set) {
+  if (fileExistsNonEmpty(set.clipY4m, set.minY4mBytes)) {
+    log(`skip: ${set.clipY4m} already exists (${fs.statSync(set.clipY4m).size} bytes)`);
+    return;
+  }
+  const rawY4m = path.join(MEDIA_DIR, `_${set.key}.raw.y4m`);
+  const args = ["-y", "-i", set.clipMp4, "-pix_fmt", "yuv420p", rawY4m];
+  log(`[${set.key}] ffmpeg ${args.join(" ")}`);
+  await run(ffmpegPath, args);
+  await patchY4mHeader(rawY4m, set.clipY4m);
   try {
     fs.unlinkSync(rawY4m);
   } catch {}
-  log(`generated ${CLIP_Y4M} (${fs.statSync(CLIP_Y4M).size} bytes)`);
+  log(`[${set.key}] generated ${set.clipY4m} (${fs.statSync(set.clipY4m).size} bytes)`);
 }
 
-async function main() {
-  log("=== fetch-media: start ===");
-  const chosen = await ensureSrcVideo();
-  await ensureClipMp4();
-  await ensureClipY4m();
+async function processSet(set) {
+  log(`=== [${set.key}] start ===`);
+  const chosen = await ensureSrcVideo(set);
+  await ensureClipMp4(set);
+  await ensureClipY4m(set);
 
-  const clipDuration = await probeDurationSec(CLIP_MP4).catch(() => null);
-  const clipRes = await probeResolution(CLIP_MP4).catch(() => null);
-  const y4mHead = fs.readFileSync(CLIP_Y4M).subarray(0, 200).toString("ascii").split("\n")[0];
+  const clipDuration = await probeDurationSec(set.clipMp4).catch(() => null);
+  const clipRes = await probeResolution(set.clipMp4).catch(() => null);
+  const y4mHead = fs
+    .readFileSync(set.clipY4m)
+    .subarray(0, 200)
+    .toString("ascii")
+    .split("\n")[0];
 
-  // run.mjs が「クリップ実尺+1秒」の待機時間を算出するために読む軽量メタデータ
-  fs.writeFileSync(
-    CLIP_META,
-    JSON.stringify(
-      {
-        width: clipRes?.width ?? TARGET_W,
-        height: clipRes?.height ?? TARGET_H,
-        durationSec: clipDuration ?? TARGET_DURATION_SEC,
-        fps: TARGET_FPS,
-        y4mHeader: y4mHead,
-        sourceUrl: chosen.url,
-      },
-      null,
-      2
-    )
-  );
+  // run.mjs等が実尺(待機時間の算出)に使う軽量メタデータ。既存の{width,height,durationSec,fps,
+  // y4mHeader,sourceUrl}のshapeは維持し、notesがあるセットのみ追加フィールドとして書き出す。
+  const metaObj = {
+    width: clipRes?.width ?? set.targetW,
+    height: clipRes?.height ?? set.targetH,
+    durationSec: clipDuration ?? set.targetDurationSec,
+    fps: set.targetFps,
+    y4mHeader: y4mHead,
+    sourceUrl: chosen.url,
+  };
+  if (set.notes) metaObj.notes = set.notes;
+  fs.writeFileSync(set.clipMeta, JSON.stringify(metaObj, null, 2));
 
-  log("--- summary ---");
+  log(`--- [${set.key}] summary ---`);
   log(`source: ${chosen.url}`);
   if (chosen.page) log(`page: ${chosen.page}`);
   if (chosen.author) log(`author: ${chosen.author}`);
   if (chosen.license) log(`license: ${chosen.license}`);
-  log(`clip.mp4: ${clipRes ? `${clipRes.width}x${clipRes.height}` : "?"} , ${clipDuration ? clipDuration.toFixed(2) : "?"}s`);
-  log(`clip.y4m header: ${y4mHead}`);
+  log(
+    `${path.basename(set.clipMp4)}: ${clipRes ? `${clipRes.width}x${clipRes.height}` : "?"} , ${
+      clipDuration ? clipDuration.toFixed(2) : "?"
+    }s`
+  );
+  log(`${path.basename(set.clipY4m)} header: ${y4mHead}`);
+
+  return { set, chosen, clipDuration, clipRes, y4mHead };
+}
+
+async function main() {
+  log("=== fetch-media: start ===");
+  const results = [];
+  for (const set of MEDIA_MANIFEST) {
+    results.push(await processSet(set));
+  }
+  log("=== fetch-media: all sets done ===");
+  for (const r of results) {
+    log(
+      `[summary] ${r.set.key}: ${path.basename(r.set.clipMp4)} (${
+        r.clipRes ? `${r.clipRes.width}x${r.clipRes.height}` : "?"
+      }, ${r.clipDuration ? r.clipDuration.toFixed(2) : "?"}s) <- ${r.chosen.url}`
+    );
+  }
   log("=== fetch-media: done ===");
 }
 

@@ -5,9 +5,11 @@
 // PASS/WARN/FAIL表をコンソールと out/report.md に出力し、失敗時は非ゼロexitする。
 //
 // 使い方:
-//   - run.mjs から `import { runChecks } from "./checks.mjs"` して直接呼ぶ(推奨・通常経路)
-//   - もしくは単体で `node test/tracking/checks.mjs` を実行し、out/web-landmarks.json /
-//     out/web-stats.json を読み込んでチェックする(run.mjsを介さない再チェック用)
+//   - run.mjs から `import { runChecks } from "./checks.mjs"` して直接呼ぶ(推奨・通常経路。
+//     run.mjs --media <key> で対象メディアを切り替えた場合もこの経路でそのまま動く)
+//   - もしくは単体で `node test/tracking/checks.mjs [--media <key>]` を実行し、
+//     out/[<key>-]web-landmarks.json / out/[<key>-]web-stats.json を読み込んでチェックする
+//     (run.mjsを介さない再チェック用。--media省略時は既定"clip"=既存の out/web-*.json を読む)
 //
 // 前提となる __dump() の形状(CONTRACT.md, verify.html仕様):
 //   { meta: {width, height, startedAt},
@@ -264,12 +266,26 @@ export function runChecks(dump, stats) {
   return { pass, rows, reportMd, computed: { detectRate, detected, total, boneCV, symmetry, angleViol } };
 }
 
+// --media <key> (既定 "clip")。run.mjs と同じ命名規則(clip以外は out/<key>-xxx)で読み書きする。
+function parseMediaKey(argv) {
+  const idx = argv.indexOf("--media");
+  if (idx === -1 || idx + 1 >= argv.length) return "clip";
+  const key = argv[idx + 1];
+  if (!/^[a-zA-Z0-9_-]+$/.test(key)) {
+    throw new Error(`invalid --media value: ${key}`);
+  }
+  return key;
+}
+
 async function mainStandalone() {
-  const dumpPath = path.join(OUT_DIR, "web-landmarks.json");
-  const statsPath = path.join(OUT_DIR, "web-stats.json");
+  const mediaKey = parseMediaKey(process.argv);
+  const outName = (base) => (mediaKey === "clip" ? base : `${mediaKey}-${base}`);
+  const dumpPath = path.join(OUT_DIR, outName("web-landmarks.json"));
+  const statsPath = path.join(OUT_DIR, outName("web-stats.json"));
+  const reportPath = path.join(OUT_DIR, outName("report.md"));
   if (!fs.existsSync(dumpPath) || !fs.existsSync(statsPath)) {
     console.error(
-      `[checks] ${dumpPath} / ${statsPath} が見つかりません。先に run.mjs を実行してください。`
+      `[checks] ${dumpPath} / ${statsPath} が見つかりません。先に node test/tracking/run.mjs --media ${mediaKey} を実行してください。`
     );
     process.exit(1);
   }
@@ -277,7 +293,7 @@ async function mainStandalone() {
   const stats = JSON.parse(await fsp.readFile(statsPath, "utf8"));
   const { pass, reportMd } = runChecks(dump, stats);
   await fsp.mkdir(OUT_DIR, { recursive: true });
-  await fsp.writeFile(path.join(OUT_DIR, "report.md"), reportMd);
+  await fsp.writeFile(reportPath, reportMd);
   process.exit(pass ? 0 : 1);
 }
 

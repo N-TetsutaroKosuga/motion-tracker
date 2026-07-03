@@ -8,11 +8,17 @@
 // を行う。
 //
 // 使い方:
-//   node test/tracking/run.mjs            # headless実行(通常の自動実行用)
+//   node test/tracking/run.mjs            # headless実行(通常の自動実行用、対象メディア=clip)
 //   node test/tracking/run.mjs --headed   # ヘッドあり実行(目視確認用)。まずheadedで一度
 //                                          # 確認してからheadlessで回す運用を推奨(research.md)
+//   node test/tracking/run.mjs --media punch [--headed]
+//                                          # 対象メディアをclip以外(例: punch)に切替。
+//                                          # media/<key>.y4m / media/<key>.meta.json を使い、
+//                                          # 出力は out/<key>-web-landmarks.json 等に分離する
+//                                          # (--media省略/clip指定時は既存の out/web-*.json 等の
+//                                          # ファイル名を維持し、既存の呼び出し元・後続処理を壊さない)。
 //
-// 前提: test/tracking/media/clip.y4m が事前に生成済みであること
+// 前提: test/tracking/media/<key>.y4m が事前に生成済みであること
 //       (node test/tracking/fetch-media.mjs を先に実行する)。
 //
 // 注意: このスクリプトは verify.html (s1-page 担当、本エージェントと並行実装中)に依存するため、
@@ -31,11 +37,36 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, "..", "..");
 const MEDIA_DIR = path.join(__dirname, "media");
 const OUT_DIR = path.join(__dirname, "out");
-const CLIP_Y4M = path.join(MEDIA_DIR, "clip.y4m");
-const CLIP_META = path.join(MEDIA_DIR, "clip.meta.json");
 
 const HEADED = process.argv.includes("--headed");
-const DEFAULT_CLIP_DURATION_SEC = 9; // clip.meta.jsonが無い場合のフォールバック
+
+// --media <key> (既定 "clip")。fetch-media.mjs の MEDIA_MANIFEST の key と対応させる想定
+// (例: "punch" なら media/punch.y4m / media/punch.meta.json を使う)。
+function parseMediaKey(argv) {
+  const idx = argv.indexOf("--media");
+  if (idx === -1 || idx + 1 >= argv.length) return "clip";
+  const key = argv[idx + 1];
+  if (!/^[a-zA-Z0-9_-]+$/.test(key)) {
+    throw new Error(`invalid --media value: ${key}`);
+  }
+  return key;
+}
+const MEDIA_KEY = parseMediaKey(process.argv);
+const IS_DEFAULT_MEDIA = MEDIA_KEY === "clip";
+
+const CLIP_Y4M = path.join(MEDIA_DIR, `${MEDIA_KEY}.y4m`);
+const CLIP_META = path.join(MEDIA_DIR, `${MEDIA_KEY}.meta.json`);
+
+// 出力ファイル名: 既定(clip)は既存ファイル名をそのまま維持(後方互換)。
+// clip以外は out/<key>-xxx に分離し、clip実行の成果物を上書きしない。
+const outName = (base) => (IS_DEFAULT_MEDIA ? base : `${MEDIA_KEY}-${base}`);
+const OUT_WEB_LANDMARKS = path.join(OUT_DIR, outName("web-landmarks.json"));
+const OUT_WEB_STATS = path.join(OUT_DIR, outName("web-stats.json"));
+const OUT_REPORT_MD = path.join(OUT_DIR, outName("report.md"));
+const OUT_SCREENSHOT_START = path.join(OUT_DIR, outName("screenshot-after-start.png"));
+const OUT_SCREENSHOT_RECORD = path.join(OUT_DIR, outName("screenshot-after-record.png"));
+
+const DEFAULT_CLIP_DURATION_SEC = 9; // <key>.meta.jsonが無い場合のフォールバック
 const READY_TIMEOUT_MS = 30_000;
 // --use-angle=metal 適用後でもコールドスタート(shaderキャッシュ未温間)で13秒程度かかることを
 // s1-verifyで実測したため、CI環境差を見込んで余裕を持たせる。
@@ -117,6 +148,7 @@ function withTimeout(promise, ms, message) {
 }
 
 async function main() {
+  log(`media key = "${MEDIA_KEY}"${IS_DEFAULT_MEDIA ? " (既定、出力ファイル名は従来どおり)" : " (出力ファイル名は " + MEDIA_KEY + "-* に分離)"}`);
   if (!fs.existsSync(CLIP_Y4M)) {
     console.error(
       `[run] FATAL: ${CLIP_Y4M} が見つかりません。先に node test/tracking/fetch-media.mjs を実行してください。`
@@ -178,8 +210,8 @@ async function main() {
     );
 
     // 目視確認用スクリーンショット(フェイクカメラが黒画面/フリーズしていないかの簡易確認にも使う)
-    await page.screenshot({ path: path.join(OUT_DIR, "screenshot-after-start.png") });
-    log(`saved out/screenshot-after-start.png`);
+    await page.screenshot({ path: OUT_SCREENSHOT_START });
+    log(`saved ${path.relative(REPO_ROOT, OUT_SCREENSHOT_START)}`);
 
     log("calling __record(true) ...");
     await page.evaluate(() => window.__record(true));
@@ -195,16 +227,13 @@ async function main() {
     const dump = await page.evaluate(() => window.__dump());
     const stats = await page.evaluate(() => window.__stats());
 
-    await page.screenshot({ path: path.join(OUT_DIR, "screenshot-after-record.png") });
-    log(`saved out/screenshot-after-record.png`);
+    await page.screenshot({ path: OUT_SCREENSHOT_RECORD });
+    log(`saved ${path.relative(REPO_ROOT, OUT_SCREENSHOT_RECORD)}`);
 
-    await fsp.writeFile(
-      path.join(OUT_DIR, "web-landmarks.json"),
-      JSON.stringify(dump, null, 2)
-    );
-    await fsp.writeFile(path.join(OUT_DIR, "web-stats.json"), JSON.stringify(stats, null, 2));
+    await fsp.writeFile(OUT_WEB_LANDMARKS, JSON.stringify(dump, null, 2));
+    await fsp.writeFile(OUT_WEB_STATS, JSON.stringify(stats, null, 2));
     log(
-      `saved out/web-landmarks.json (${dump?.frames?.length ?? 0} frames), out/web-stats.json`
+      `saved ${path.relative(REPO_ROOT, OUT_WEB_LANDMARKS)} (${dump?.frames?.length ?? 0} frames), ${path.relative(REPO_ROOT, OUT_WEB_STATS)}`
     );
 
     try {
@@ -214,7 +243,7 @@ async function main() {
     }
 
     const { pass, reportMd } = runChecks(dump, stats);
-    await fsp.writeFile(path.join(OUT_DIR, "report.md"), reportMd);
+    await fsp.writeFile(OUT_REPORT_MD, reportMd);
     log(pass ? "CHECKS: PASS" : "CHECKS: FAIL");
     if (!pass) exitCode = 1;
   } catch (err) {
