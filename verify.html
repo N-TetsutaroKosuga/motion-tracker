@@ -1,0 +1,1021 @@
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Verify — トラッキング検証ビュー</title>
+<style>
+  :root {
+    --bg: #070a0f;
+    --panel: #0e131c;
+    --panel-2: #131a26;
+    --line: #1f2937;
+    --text: #e5edf5;
+    --muted: #8a97a8;
+    --cyan: #22d3ee;
+    --green: #34d399;
+    --magenta: #f472b6;
+    --yellow: #fde047;
+    --danger: #f87171;
+    --radius: 16px;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background:
+      radial-gradient(1200px 600px at 80% -10%, rgba(34,211,238,0.10), transparent 60%),
+      radial-gradient(900px 500px at -10% 110%, rgba(244,114,182,0.08), transparent 55%),
+      var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Yu Gothic UI", "Segoe UI", system-ui, sans-serif;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1280px; margin: 0 auto; padding: 28px 20px 56px; }
+
+  header { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; margin-bottom: 22px; }
+  header h1 {
+    font-size: 22px; margin: 0; letter-spacing: .3px;
+    background: linear-gradient(90deg, var(--cyan), var(--yellow));
+    -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
+  }
+  header .sub { color: var(--muted); font-size: 13px; }
+
+  .app { display: grid; grid-template-columns: 1fr 340px; gap: 20px; align-items: start; }
+  @media (max-width: 980px) { .app { grid-template-columns: 1fr; } }
+
+  /* ---- Stage ---- */
+  .stage {
+    position: relative; border-radius: var(--radius); overflow: hidden;
+    background: #000; border: 1px solid var(--line);
+    box-shadow: 0 24px 60px rgba(0,0,0,.45), inset 0 0 0 1px rgba(255,255,255,.02);
+    aspect-ratio: 16 / 9;
+  }
+  #overlay { display: block; width: 100%; height: 100%; object-fit: contain; background: #000; }
+  #webcam { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; top: 0; left: 0; }
+
+  .status {
+    position: absolute; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 14px;
+    text-align: center; padding: 24px;
+    background: radial-gradient(circle at center, rgba(7,10,15,.35), rgba(7,10,15,.75));
+    backdrop-filter: blur(2px); transition: opacity .2s ease;
+  }
+  .status[hidden] { display: none; }
+  .status .big { font-size: 16px; font-weight: 600; }
+  .status .small { font-size: 13px; color: var(--muted); max-width: 460px; }
+  .status.error .big { color: var(--danger); }
+  .spinner {
+    width: 34px; height: 34px; border-radius: 50%;
+    border: 3px solid rgba(255,255,255,.15); border-top-color: var(--cyan);
+    animation: spin 0.9s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .play-badge {
+    width: 64px; height: 64px; border-radius: 50%;
+    display: grid; place-items: center; font-size: 26px;
+    background: linear-gradient(135deg, var(--cyan), var(--green)); color: #04121a;
+    box-shadow: 0 10px 30px rgba(34,211,238,.35);
+  }
+
+  .hud { position: absolute; top: 12px; left: 12px; display: flex; gap: 8px; pointer-events: none; flex-wrap: wrap; max-width: calc(100% - 24px); }
+  .chip {
+    font-variant-numeric: tabular-nums; font-size: 12px; font-weight: 600;
+    padding: 5px 10px; border-radius: 999px; color: var(--text);
+    background: rgba(8,12,18,.62); border: 1px solid rgba(255,255,255,.08);
+    backdrop-filter: blur(6px);
+  }
+  .chip b { color: var(--cyan); }
+  .legend-hud { position: absolute; bottom: 12px; left: 12px; display: flex; gap: 10px; pointer-events: none; }
+  .legend-hud .item { display: flex; align-items: center; gap: 5px; font-size: 11px; color: var(--text); background: rgba(8,12,18,.62); border: 1px solid rgba(255,255,255,.08); padding: 4px 8px; border-radius: 999px; backdrop-filter: blur(6px); }
+  .legend-hud .dot { width: 8px; height: 8px; border-radius: 50%; }
+
+  /* ---- Controls ---- */
+  .panel {
+    background: linear-gradient(180deg, var(--panel), var(--panel-2));
+    border: 1px solid var(--line); border-radius: var(--radius);
+    padding: 18px; display: flex; flex-direction: column; gap: 18px;
+  }
+  .panel section { display: flex; flex-direction: column; gap: 10px; }
+  .panel .label { font-size: 11px; letter-spacing: .12em; text-transform: uppercase; color: var(--muted); }
+
+  button { font-family: inherit; cursor: pointer; border: none; color: inherit; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+
+  .btn-primary {
+    width: 100%; padding: 13px 16px; border-radius: 12px; font-size: 15px; font-weight: 700;
+    background: linear-gradient(135deg, var(--cyan), var(--green)); color: #04121a;
+    transition: transform .08s ease, filter .15s ease;
+  }
+  .btn-primary:hover:not(:disabled) { filter: brightness(1.06); }
+  .btn-primary:active:not(:disabled) { transform: translateY(1px); }
+  .btn-primary.stop { background: linear-gradient(135deg, #fb7185, #f59e0b); color: #1a0a04; }
+
+  .toggles { display: flex; flex-direction: column; gap: 8px; }
+  .toggle {
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    padding: 10px 12px; border-radius: 10px; background: #0a0f17; border: 1px solid var(--line);
+    font-size: 14px; user-select: none;
+  }
+  .toggle .sw { width: 40px; height: 23px; border-radius: 999px; background: #2b3647; position: relative; transition: background .15s ease; flex: none; }
+  .toggle .sw::after { content: ""; position: absolute; top: 3px; left: 3px; width: 17px; height: 17px; border-radius: 50%; background: #e5edf5; transition: transform .15s ease; }
+  .toggle[aria-pressed="true"] .sw { background: linear-gradient(135deg, var(--cyan), var(--green)); }
+  .toggle[aria-pressed="true"] .sw::after { transform: translateX(17px); }
+
+  .btn-ghost { width: 100%; padding: 11px; border-radius: 10px; font-size: 14px; font-weight: 600; color: var(--text); background: #0a0f17; border: 1px solid var(--line); transition: border-color .15s ease, background .15s ease; }
+  .btn-ghost:hover:not(:disabled) { border-color: var(--cyan); background: rgba(34,211,238,.06); }
+  .btn-ghost.active { border-color: var(--magenta); background: rgba(244,114,182,.12); color: var(--magenta); }
+
+  .note { font-size: 12px; color: var(--muted); line-height: 1.7; }
+  .note b { color: var(--text); }
+  .note code { background: #0a0f17; border: 1px solid var(--line); padding: 1px 6px; border-radius: 6px; color: var(--green); font-size: 12px; }
+  .insecure { display: none; margin-top: 14px; padding: 12px 14px; border-radius: 10px; background: rgba(248,113,113,.1); border: 1px solid rgba(248,113,113,.35); color: #fecaca; font-size: 13px; }
+  .insecure code { color: #fecaca; background: rgba(0,0,0,.25); border-color: rgba(248,113,113,.3); }
+  footer { margin-top: 26px; color: var(--muted); font-size: 12px; }
+
+  /* ---- Measurement panel ---- */
+  .lab { margin-top: 20px; display: flex; flex-direction: column; gap: 16px; }
+  .card {
+    background: linear-gradient(180deg, var(--panel), var(--panel-2));
+    border: 1px solid var(--line); border-radius: var(--radius);
+    padding: 18px; display: flex; flex-direction: column; gap: 14px;
+  }
+  .card-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+  .card-head .label { font-size: 11px; letter-spacing: .12em; text-transform: uppercase; color: var(--muted); }
+
+  .badge { padding: 4px 12px; border-radius: 999px; font-size: 12px; font-weight: 800; letter-spacing: .04em; }
+  .badge.pass { background: rgba(52,211,153,.15); color: var(--green); border: 1px solid rgba(52,211,153,.4); }
+  .badge.warn { background: rgba(253,224,71,.15); color: var(--yellow); border: 1px solid rgba(253,224,71,.4); }
+  .badge.fail { background: rgba(248,113,113,.15); color: var(--danger); border: 1px solid rgba(248,113,113,.4); }
+
+  .statgrid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+  @media (max-width: 900px) { .statgrid { grid-template-columns: repeat(2, 1fr); } }
+  .stat { background: #0a0f17; border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; display: flex; flex-direction: column; gap: 4px; }
+  .stat .v { font-size: 18px; font-weight: 800; font-variant-numeric: tabular-nums; color: var(--cyan); line-height: 1.2; }
+  .stat .k { font-size: 10.5px; color: var(--muted); letter-spacing: .06em; text-transform: uppercase; }
+  .stat .b { margin-top: 2px; }
+
+  .btnrow { display: flex; gap: 10px; flex-wrap: wrap; }
+  .btnrow .btn-ghost { width: auto; flex: 1 1 180px; }
+
+  .thresholds { font-size: 12px; color: var(--muted); line-height: 1.8; }
+  .thresholds table { width: 100%; border-collapse: collapse; margin-top: 6px; }
+  .thresholds th, .thresholds td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+  .thresholds th { color: var(--text); font-weight: 600; }
+</style>
+
+<div class="wrap">
+  <header>
+    <h1>◎ Verify</h1>
+    <span class="sub">Webカメラのポーズトラッキングが正しく取れているかを目視 + 数値で検証</span>
+  </header>
+
+  <div class="app">
+    <!-- Stage -->
+    <div class="stage">
+      <video id="webcam" autoplay muted playsinline></video>
+      <canvas id="overlay" width="1280" height="720"></canvas>
+
+      <div class="hud">
+        <span class="chip">FPS <b id="fpsChip">–</b></span>
+        <span class="chip">検出率 <b id="detectChip">–</b></span>
+        <span class="chip">総合 <b id="overallChip">–</b></span>
+        <span class="chip">記録 <b id="recChip">off</b></span>
+      </div>
+      <div class="legend-hud">
+        <span class="item"><span class="dot" style="background:#34d399"></span>vis≥0.8</span>
+        <span class="item"><span class="dot" style="background:#fde047"></span>vis≥0.5</span>
+        <span class="item"><span class="dot" style="background:#f87171"></span>vis&lt;0.5</span>
+      </div>
+
+      <div class="status" id="status">
+        <div class="spinner"></div>
+        <div class="big">検証モデルを読み込み中…</div>
+        <div class="small">初回はモデルのダウンロードに数秒かかります。</div>
+      </div>
+    </div>
+
+    <!-- Controls -->
+    <div class="panel">
+      <section>
+        <button id="toggleCam" class="btn-primary" disabled>▶ トラッキング開始</button>
+      </section>
+
+      <section>
+        <span class="label">表示オプション</span>
+        <div class="toggles">
+          <div class="toggle" id="tglMirror" aria-pressed="true" role="button" tabindex="0"><span>ミラー表示（自撮り）</span><span class="sw"></span></div>
+          <div class="toggle" id="tglVideo" aria-pressed="true" role="button" tabindex="0"><span>カメラ映像を表示</span><span class="sw"></span></div>
+        </div>
+      </section>
+
+      <section>
+        <span class="label">フレーム記録（<code style="background:#0a0f17;border:1px solid var(--line);padding:1px 6px;border-radius:6px;color:var(--green)">window.__dump()</code> 用）</span>
+        <button id="recordBtn" class="btn-ghost">● 記録開始</button>
+      </section>
+
+      <section>
+        <span class="label">書き出し</span>
+        <div class="btnrow">
+          <button id="csvBtn" class="btn-ghost" disabled>📄 計測ログCSV</button>
+          <button id="snapBtn" class="btn-ghost" disabled>📸 スナップショット</button>
+        </div>
+      </section>
+
+      <div class="note">
+        <b>使い方</b>: 全身が映る距離でカメラの前に立ち、「トラッキング開始」を押してください。骨格線の色は
+        visibility（信頼度）を表します。緑=高信頼、黄=中、赤=低信頼（オクルージョン等）。
+        下の計測パネルで数値検証、CSVボタンでログを保存できます。
+      </div>
+      <div class="insecure" id="insecure"></div>
+    </div>
+  </div>
+
+  <!-- Measurement panel -->
+  <div class="lab">
+    <div class="card">
+      <div class="card-head">
+        <span class="label">計測パネル（直近5秒窓・1秒毎更新）</span>
+        <span class="badge" id="overallBadge">–</span>
+      </div>
+      <div class="statgrid">
+        <div class="stat">
+          <div class="v" id="statFps">–</div>
+          <div class="k">FPS</div>
+        </div>
+        <div class="stat">
+          <div class="v" id="statDetect">–</div>
+          <div class="k">検出率</div>
+        </div>
+        <div class="stat">
+          <div class="v" id="statBoneCV">–</div>
+          <div class="k">主要8ボーンCV（overall）</div>
+          <span class="badge b" id="badgeBoneCV">–</span>
+        </div>
+        <div class="stat">
+          <div class="v" id="statBoneWorst">–</div>
+          <div class="k">CV最悪ボーン</div>
+        </div>
+        <div class="stat">
+          <div class="v" id="statSymmetry">–</div>
+          <div class="k">左右対称性誤差</div>
+          <span class="badge b" id="badgeSymmetry">–</span>
+        </div>
+        <div class="stat">
+          <div class="v" id="statJitterSigma">–</div>
+          <div class="k">ジッター σ（静止時・正規化座標）</div>
+          <span class="badge b" id="badgeJitter">–</span>
+        </div>
+        <div class="stat">
+          <div class="v" id="statJitterRms">–</div>
+          <div class="k">ジッター RMS（フレーム間・正規化座標）</div>
+        </div>
+        <div class="stat">
+          <div class="v" id="statAngleViol">–</div>
+          <div class="k">関節可動域逸脱（累積数）</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><span class="label">閾値の根拠（暫定値）</span></div>
+      <div class="thresholds">
+        対象ボーン（8本、<code>poseWorldLandmarks</code> のメートル座標で算出）:
+        upperArmL(11-13) / upperArmR(12-14) / forearmL(13-15) / forearmR(14-16) /
+        thighL(23-25) / thighR(24-26) / shinL(25-27) / shinR(26-28)。
+        剛体である骨の長さは本来フレーム間で一定のはずなので、変動係数(CV=標準偏差/平均)が
+        トラッキング精度の指標になる。左右対称性は対になる4組（上腕/前腕/大腿/下腿）の平均長の相対差。
+        ジッターσは「静止判定（2D速度 &lt; 0.25 /秒 相当）」中のフレームのみを対象にした位置のばらつき、
+        RMSは検出フレーム間の位置変化のRMS（静止・動作を問わない）。関節可動域逸脱は、肘/膝の3点角度が
+        10°未満（ランドマーク重なり＝オクルージョン崩壊の疑い）、または前フレームから45°/フレーム超で
+        急変した場合（トラッキング破綻の疑い）を累積カウントしたもの。
+        <table>
+          <tr><th>指標</th><th>PASS</th><th>WARN</th><th>FAIL</th></tr>
+          <tr><td>検出率</td><td>≥ 0.90</td><td>0.70–0.90</td><td>&lt; 0.70</td></tr>
+          <tr><td>ボーンCV(overall)</td><td>&lt; 0.15</td><td>0.15–0.30</td><td>≥ 0.30</td></tr>
+          <tr><td>左右対称性誤差</td><td>&lt; 0.20</td><td>0.20–0.35</td><td>≥ 0.35</td></tr>
+          <tr><td>ジッターσ(正規化)</td><td>&lt; 0.004</td><td>0.004–0.010</td><td>≥ 0.010</td></tr>
+        </table>
+        検出率/ボーンCV/対称性の暫定値は <code>test/tracking/checks.mjs</code>
+        の不変量チェックと揃えてある。ジッターσは 1280px 基準でおよそ 5px / 13px のブレに相当する値を仮置きした
+        （実測分布が出た段階で調整する前提の初期値）。「総合」はこれら4指標のうち最も悪い判定を採用する。
+      </div>
+    </div>
+  </div>
+
+  <footer>
+    ブラウザ内で完結（映像は外部に送信されません）。動かすには <code>python3 -m http.server 8000</code> でこのフォルダを配信し、
+    <code>http://localhost:8000/verify.html</code> を Chrome / Safari で開いてください。
+    実カメラ・フェイクカメラ（<code>--use-fake-device-for-media-stream</code>）のどちらでも同一の経路で動作します。
+  </footer>
+</div>
+
+<script type="module">
+  import {
+    FilesetResolver,
+    HolisticLandmarker,
+    DrawingUtils,
+  } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/vision_bundle.mjs";
+
+  // ===== 検証済み定数（@0.10.35。import は .mjs ファイル、wasm は /wasm ディレクトリ。pin一致必須）=====
+  const WASM_URL = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/wasm";
+  const HOLISTIC_MODEL = "https://storage.googleapis.com/mediapipe-models/holistic_landmarker/holistic_landmarker/float16/latest/holistic_landmarker.task";
+  const COLORS = { cyan: "#22d3ee", green: "#34d399", magenta: "#f472b6", white: "#ffffff", yellow: "#fde047", danger: "#f87171" };
+
+  // ===== DOM =====
+  const video = document.getElementById("webcam");
+  const canvas = document.getElementById("overlay");
+  const ctx = canvas.getContext("2d");
+  const du = new DrawingUtils(ctx); // 手・顔メッシュ描画に使用（visibility色分けはpose用に自前描画）
+
+  const toggleCamBtn = document.getElementById("toggleCam");
+  const statusEl = document.getElementById("status");
+  const insecureEl = document.getElementById("insecure");
+  const tglMirror = document.getElementById("tglMirror");
+  const tglVideo = document.getElementById("tglVideo");
+  const recordBtn = document.getElementById("recordBtn");
+  const csvBtn = document.getElementById("csvBtn");
+  const snapBtn = document.getElementById("snapBtn");
+
+  const fpsChipEl = document.getElementById("fpsChip");
+  const detectChipEl = document.getElementById("detectChip");
+  const overallChipEl = document.getElementById("overallChip");
+  const recChipEl = document.getElementById("recChip");
+
+  const statFpsEl = document.getElementById("statFps");
+  const statDetectEl = document.getElementById("statDetect");
+  const statBoneCVEl = document.getElementById("statBoneCV");
+  const statBoneWorstEl = document.getElementById("statBoneWorst");
+  const statSymmetryEl = document.getElementById("statSymmetry");
+  const statJitterSigmaEl = document.getElementById("statJitterSigma");
+  const statJitterRmsEl = document.getElementById("statJitterRms");
+  const statAngleViolEl = document.getElementById("statAngleViol");
+  const overallBadgeEl = document.getElementById("overallBadge");
+  const badgeBoneCVEl = document.getElementById("badgeBoneCV");
+  const badgeSymmetryEl = document.getElementById("badgeSymmetry");
+  const badgeJitterEl = document.getElementById("badgeJitter");
+
+  // ===== 主要8ボーン定義（poseWorldLandmarks のインデックス。BlazePose 33点規約）=====
+  const BONES = [
+    { name: "upperArmL", a: 11, b: 13 },
+    { name: "upperArmR", a: 12, b: 14 },
+    { name: "forearmL", a: 13, b: 15 },
+    { name: "forearmR", a: 14, b: 16 },
+    { name: "thighL", a: 23, b: 25 },
+    { name: "thighR", a: 24, b: 26 },
+    { name: "shinL", a: 25, b: 27 },
+    { name: "shinR", a: 26, b: 28 },
+  ];
+  const SYMMETRY_PAIRS = [["upperArmL", "upperArmR"], ["forearmL", "forearmR"], ["thighL", "thighR"], ["shinL", "shinR"]];
+  const JOINTS = [
+    { name: "elbowL", a: 11, j: 13, b: 15 },
+    { name: "elbowR", a: 12, j: 14, b: 16 },
+    { name: "kneeL", a: 23, j: 25, b: 27 },
+    { name: "kneeR", a: 24, j: 26, b: 28 },
+  ];
+  const VIS_THRESH = 0.5;
+
+  // ===== 判定閾値（ページ内注記と一致させる。checks.mjs の不変量と揃えた暫定値）=====
+  const TH = {
+    detectRate: { passMin: 0.90, warnMin: 0.70 },
+    boneCV: { passMax: 0.15, warnMax: 0.30 },
+    symmetry: { passMax: 0.20, warnMax: 0.35 },
+    jitterSigma: { passMax: 0.004, warnMax: 0.010 },
+  };
+  const ANGLE_MIN_DEG = 10;       // これ未満は関節が潰れている(オクルージョン崩壊)疑い
+  const ANGLE_JUMP_MAX_DEG = 45;  // 1フレームでこれ以上変化したら破綻の疑い
+  const ANGLE_JUMP_MAX_DT_MS = 500; // これより長い間隔が空いていたら急変チェックは行わない
+
+  const STILL_SPEED_THRESH = 0.25; // 正規化座標/秒（depth-lab.html の値を踏襲）
+  const WINDOW_MS = 5000;          // 計測窓（直近5秒）
+  const HISTORY_MS = 7000;         // 内部バッファの保持長（窓+余裕）
+
+  // ===== 状態 =====
+  let holistic = null;
+  let holisticInitPromise = null;
+  let running = false;    // トラッキング中か
+  let starting = false;
+  let stream = null;
+  let lastVideoTime = -1;
+  let lastResult = null;
+  let rafId = null;
+  const settings = { mirror: true, showVideo: true };
+
+  let trackingStartedAt = 0; // performance.now()。fps窓の下限クランプに使用
+  let firstFrameResolve = null;
+
+  // metricsHistory: 全フレーム（検出成否問わず）を保持。fps/検出率/CV/対称性/ジッター/角度逸脱の単一ソース
+  let metricsHistory = [];
+  let angleViolations = 0;
+  const prevAngle = { elbowL: null, elbowR: null, kneeL: null, kneeR: null };
+  const prevAngleT = { elbowL: null, elbowR: null, kneeL: null, kneeR: null };
+
+  // 記録（__record/__dump 用）
+  let recording = false;
+  let recordBuffer = [];
+  let recordMeta = null;
+  // recordBuffer には検出成功フレームのみを積む(pose2d/world/visの33要素固定shapeを保つ設計)ため、
+  // 「検出できなかったフレーム」が recordBuffer から完全に消え、frames配列だけから検出率を逆算すると
+  // 常に100%近くに水増しされてしまう。記録区間中の全試行回数/検出成功回数を別途カウントし、
+  // meta経由で真の検出率を計算できるようにする(s1-verifyで発見・修正)。
+  let recordTotalTicks = 0;
+  let recordDetectedTicks = 0;
+
+  // 計測ログ（CSV書き出し用、1Hz）
+  let statsLog = [];
+
+  // FPS表示（HUD用、簡易カウンタ）
+  let fpsT0 = 0, fpsFrames = 0, fpsDisplay = 0;
+
+  // ===== ユーティリティ =====
+  function setStatus(kind, big, small) {
+    if (kind === "hide") { statusEl.hidden = true; return; }
+    statusEl.hidden = false;
+    statusEl.className = "status" + (kind === "error" ? " error" : "");
+    const icon = kind === "loading"
+      ? '<div class="spinner"></div>'
+      : kind === "error" ? '<div class="play-badge" style="background:#3a1414;color:#fca5a5">!</div>'
+      : '<div class="play-badge">▶</div>';
+    statusEl.innerHTML = icon +
+      '<div class="big">' + big + "</div>" +
+      (small ? '<div class="small">' + small + "</div>" : "");
+  }
+
+  function cameraErrorMessage(e) {
+    switch (e && e.name) {
+      case "NotAllowedError": return "カメラの使用が許可されませんでした。ブラウザのアドレスバーのカメラアイコンから許可してください。";
+      case "NotFoundError": return "カメラが見つかりませんでした。デバイスの接続を確認してください。";
+      case "NotReadableError": return "カメラが他のアプリで使用中の可能性があります。他のアプリを閉じて再試行してください。";
+      case "OverconstrainedError": return "要求した解像度に対応していません。";
+      default: return "カメラを起動できませんでした: " + (e && (e.name + " / " + e.message));
+    }
+  }
+
+  function mean(arr) { return arr.reduce((s, v) => s + v, 0) / arr.length; }
+  function stdDev(arr) {
+    if (arr.length === 0) return null;
+    const m = mean(arr);
+    return Math.sqrt(mean(arr.map((v) => (v - m) * (v - m))));
+  }
+  function fmtNum(v, digits) { return (v == null || !isFinite(v)) ? "–" : v.toFixed(digits == null ? 3 : digits); }
+  function fmtPct(v, digits) { return (v == null || !isFinite(v)) ? "–" : (v * 100).toFixed(digits == null ? 1 : digits) + "%"; }
+
+  function worstVerdict(...vs) {
+    const rank = { pass: 0, warn: 1, fail: 2 };
+    let w = "pass";
+    for (const v of vs) if (v && rank[v] > rank[w]) w = v;
+    return w;
+  }
+  function verdictLte(value, passMax, warnMax) {
+    if (value == null || !isFinite(value)) return "warn"; // データ不足は警告扱い
+    if (value <= passMax) return "pass";
+    if (value <= warnMax) return "warn";
+    return "fail";
+  }
+  function verdictGte(value, passMin, warnMin) {
+    if (value == null || !isFinite(value)) return "warn";
+    if (value >= passMin) return "pass";
+    if (value >= warnMin) return "warn";
+    return "fail";
+  }
+
+  // ===== Holisticモデル初期化（ページロード時に先行実行。GPU→CPUフォールバック）=====
+  async function ensureHolistic() {
+    if (holistic) return holistic;
+    if (holisticInitPromise) return holisticInitPromise;
+    holisticInitPromise = (async () => {
+      const fileset = await FilesetResolver.forVisionTasks(WASM_URL);
+      const build = (delegate) => HolisticLandmarker.createFromOptions(fileset, {
+        baseOptions: { modelAssetPath: HOLISTIC_MODEL, delegate },
+        runningMode: "VIDEO",
+      });
+      let lm;
+      try { lm = await build("GPU"); }
+      catch (e) { console.warn("GPU初期化に失敗。CPUにフォールバックします。", e); lm = await build("CPU"); }
+      holistic = lm;
+      return lm;
+    })();
+    return holisticInitPromise;
+  }
+
+  // ===== カメラ + トラッキング開始/停止 =====
+  async function start() {
+    if (running) return; // 既に稼働中なら冪等に成功扱い
+    if (starting) throw new Error("start() is already in progress");
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setStatus("error", "このページではカメラを使えません", "http://localhost で開く必要があります（file:// では動作しません）。");
+      throw new Error("getUserMedia unavailable");
+    }
+    starting = true;
+    toggleCamBtn.disabled = true;
+    try {
+      setStatus("loading", "モデルを読み込み中…");
+      await ensureHolistic(); // 通常はページロード時に完了済み
+
+      setStatus("loading", "カメラを起動中…");
+      if (stream) { stream.getTracks().forEach((t) => t.stop()); stream = null; }
+      let s;
+      try {
+        s = await navigator.mediaDevices.getUserMedia({
+          audio: false,
+          video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" },
+        });
+      } catch (e) {
+        setStatus("error", "カメラを起動できません", cameraErrorMessage(e));
+        throw e;
+      }
+      stream = s;
+      video.srcObject = stream;
+      await new Promise((res) => {
+        if (video.readyState >= 1) res();
+        else video.addEventListener("loadedmetadata", res, { once: true });
+      });
+      try { await video.play(); } catch (e) { console.warn("video.play()", e); }
+
+      canvas.width = video.videoWidth || 1280;
+      canvas.height = video.videoHeight || 720;
+
+      // セッションリセット（計測系のみ。記録[recording/recordBuffer/recordMeta]は
+      // __record() が独立して管理するため、__start() 前後の呼び出し順序に関わらずここでは触らない）
+      metricsHistory = [];
+      angleViolations = 0;
+      prevAngle.elbowL = prevAngle.elbowR = prevAngle.kneeL = prevAngle.kneeR = null;
+      prevAngleT.elbowL = prevAngleT.elbowR = prevAngleT.kneeL = prevAngleT.kneeR = null;
+      statsLog = [];
+      // __record(true) が __start() より先に呼ばれていた場合、meta.width/height はまだ0のことがある。
+      // ここでカメラの実解像度が確定したタイミングで補完する。
+      if (recording && recordMeta && !recordMeta.width && !recordMeta.height) {
+        recordMeta.width = canvas.width;
+        recordMeta.height = canvas.height;
+      }
+
+      running = true;
+      lastVideoTime = -1;
+      lastResult = null;
+      trackingStartedAt = performance.now();
+      fpsT0 = trackingStartedAt;
+      fpsFrames = 0;
+
+      setStatus("hide");
+      setRunningUI(true);
+      csvBtn.disabled = false;
+      snapBtn.disabled = false;
+
+      const firstFramePromise = new Promise((resolve) => { firstFrameResolve = resolve; });
+      loop();
+      await firstFramePromise;
+    } finally {
+      starting = false;
+      toggleCamBtn.disabled = false;
+    }
+  }
+
+  function stop() {
+    running = false;
+    if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
+    if (stream) { stream.getTracks().forEach((t) => t.stop()); stream = null; }
+    video.srcObject = null;
+    lastResult = null;
+    firstFrameResolve = null;
+    paintIdleBackground();
+    setRunningUI(false);
+    setStatus("idle", "トラッキング停止中", "「トラッキング開始」で再開します。");
+  }
+
+  function setRunningUI(on) {
+    toggleCamBtn.textContent = on ? "■ トラッキング停止" : "▶ トラッキング開始";
+    toggleCamBtn.classList.toggle("stop", on);
+  }
+
+  function paintIdleBackground() {
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+  }
+
+  // ===== 幾何 =====
+  function dist3(a, b) { return Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z); }
+  function angleAt(world, aIdx, jIdx, bIdx) {
+    const A = world[aIdx], J = world[jIdx], B = world[bIdx];
+    if (!A || !J || !B) return null;
+    const v1 = { x: A.x - J.x, y: A.y - J.y, z: A.z - J.z };
+    const v2 = { x: B.x - J.x, y: B.y - J.y, z: B.z - J.z };
+    const n1 = Math.hypot(v1.x, v1.y, v1.z), n2 = Math.hypot(v2.x, v2.y, v2.z);
+    if (n1 < 1e-6 || n2 < 1e-6) return null;
+    const dot = v1.x * v2.x + v1.y * v2.y + v1.z * v2.z;
+    const cos = Math.min(1, Math.max(-1, dot / (n1 * n2)));
+    return (Math.acos(cos) * 180) / Math.PI;
+  }
+  function visOk(vis, idx) { return vis && vis[idx] != null ? vis[idx] >= VIS_THRESH : true; }
+
+  // ===== フレーム処理: メトリクス履歴へpush、関節角逸脱を累積、記録バッファへ追加 =====
+  function processFrame(res, nowMs) {
+    const lm2 = res && res.poseLandmarks && res.poseLandmarks[0];
+    const world = res && res.poseWorldLandmarks && res.poseWorldLandmarks[0];
+    const lh = res && res.leftHandLandmarks && res.leftHandLandmarks[0];
+    const rh = res && res.rightHandLandmarks && res.rightHandLandmarks[0];
+    const detected = !!(lm2 && world);
+
+    let vis = null;
+    if (detected) {
+      vis = lm2.map((p) => (p && p.visibility != null ? p.visibility : 1));
+
+      // 関節可動域チェック（肘・膝の3点角度）
+      for (const jt of JOINTS) {
+        if (!visOk(vis, jt.a) || !visOk(vis, jt.j) || !visOk(vis, jt.b)) continue;
+        const ang = angleAt(world, jt.a, jt.j, jt.b);
+        if (ang == null) continue;
+        if (ang < ANGLE_MIN_DEG) angleViolations++;
+        const pa = prevAngle[jt.name], pt = prevAngleT[jt.name];
+        if (pa != null && pt != null && (nowMs - pt) <= ANGLE_JUMP_MAX_DT_MS) {
+          if (Math.abs(ang - pa) > ANGLE_JUMP_MAX_DEG) angleViolations++;
+        }
+        prevAngle[jt.name] = ang;
+        prevAngleT[jt.name] = nowMs;
+      }
+    }
+
+    metricsHistory.push({ t: nowMs, detected, lm2: detected ? lm2 : null, world: detected ? world : null, vis });
+    const cutoff = nowMs - HISTORY_MS;
+    while (metricsHistory.length && metricsHistory[0].t < cutoff) metricsHistory.shift();
+
+    if (recording) {
+      recordTotalTicks++;
+      if (detected) recordDetectedTicks++;
+    }
+    if (recording && detected) {
+      recordBuffer.push({
+        t: nowMs - recordMeta.startedAt, // 記録開始からの相対ms（meta.startedAtが基準）
+        // video.currentTime はフェイクカメラ(MediaStreamTrack)ではライブ映像同様
+        // record()呼び出しでリセットされず単調増加し続ける。ソース動画(ループ再生)の
+        // 「コンテンツ内での実位置」を表すため、Pythonクロスチェック(extract.pyのtMsは
+        // 動画ファイル先頭=0msの絶対位置)との時刻対応付けにはこちらを使う
+        // (tはPython側と直接比較できない旨、s1-verifyで発見・修正。compare.py参照)。
+        videoTimeMs: video.currentTime * 1000,
+        pose2d: lm2.map((p) => [p.x, p.y, p.z]),
+        world: world.map((p) => [p.x, p.y, p.z]),
+        vis: vis.slice(),
+        hands: { left: !!(lh && lh.length), right: !!(rh && rh.length) },
+      });
+    }
+
+    lastResult = res;
+  }
+
+  // ===== 計測（1Hz UI更新 と window.__stats() の共通ロジック）=====
+  function computeMetrics() {
+    const now = performance.now();
+    const windowStart = Math.max(now - WINDOW_MS, trackingStartedAt || 0);
+    const win = metricsHistory.filter((h) => h.t >= windowStart && h.t <= now);
+
+    const count = win.length;
+    const denomSec = Math.max(0.2, (now - windowStart) / 1000);
+    const fps = count > 0 ? count / denomSec : 0;
+    const detectedCount = win.filter((h) => h.detected).length;
+    const detectRate = count > 0 ? detectedCount / count : null;
+
+    const detected = win.filter((h) => h.detected);
+
+    // ボーン長CV
+    const boneCV = { overall: null, worst: { bone: null, cv: null } };
+    const boneLens = {};
+    for (const bone of BONES) boneLens[bone.name] = [];
+    for (const h of detected) {
+      for (const bone of BONES) {
+        if (!visOk(h.vis, bone.a) || !visOk(h.vis, bone.b)) continue;
+        const A = h.world[bone.a], B = h.world[bone.b];
+        if (!A || !B) continue;
+        boneLens[bone.name].push(dist3(A, B));
+      }
+    }
+    const cvs = [];
+    for (const bone of BONES) {
+      const arr = boneLens[bone.name];
+      if (arr.length < 5) continue;
+      const m = mean(arr);
+      if (m <= 1e-6) continue;
+      const cv = stdDev(arr) / m;
+      cvs.push({ bone: bone.name, cv });
+    }
+    if (cvs.length) {
+      boneCV.overall = mean(cvs.map((c) => c.cv));
+      boneCV.worst = cvs.reduce((w, c) => (c.cv > w.cv ? c : w), cvs[0]);
+    }
+
+    // 左右対称性
+    const symmetry = { overall: null };
+    const relDiffs = [];
+    for (const [ln, rn] of SYMMETRY_PAIRS) {
+      const la = boneLens[ln], ra = boneLens[rn];
+      if (la.length < 3 || ra.length < 3) continue;
+      const ml = mean(la), mr = mean(ra);
+      if (ml + mr <= 1e-6) continue;
+      relDiffs.push(Math.abs(ml - mr) / ((ml + mr) / 2));
+    }
+    if (relDiffs.length) symmetry.overall = mean(relDiffs);
+
+    // ジッター（正規化2D座標）
+    const jitter = { sigma2d: null, rms2d: null };
+    // still判定: 検出フレーム列上で、可視ランドマーク重心の2D速度が閾値未満
+    const centroids = detected.map((h) => {
+      const pts = [];
+      for (let i = 0; i < h.lm2.length; i++) if (visOk(h.vis, i)) pts.push(h.lm2[i]);
+      if (!pts.length) return null;
+      return { t: h.t, x: mean(pts.map((p) => p.x)), y: mean(pts.map((p) => p.y)), lm2: h.lm2, vis: h.vis };
+    }).filter(Boolean);
+
+    const stillFrames = [];
+    for (let i = 0; i < centroids.length; i++) {
+      if (i === 0) { stillFrames.push(centroids[i]); continue; }
+      const dt = (centroids[i].t - centroids[i - 1].t) / 1000;
+      if (dt <= 0) { stillFrames.push(centroids[i]); continue; }
+      const spd = Math.hypot(centroids[i].x - centroids[i - 1].x, centroids[i].y - centroids[i - 1].y) / dt;
+      if (spd < STILL_SPEED_THRESH) stillFrames.push(centroids[i]);
+    }
+    if (stillFrames.length >= 3) {
+      // ランドマークごとの平均位置からの距離二乗を平均→sqrt
+      const n = 33;
+      const sums = new Array(n).fill(0).map(() => ({ x: 0, y: 0, c: 0 }));
+      for (const f of stillFrames) {
+        for (let i = 0; i < n; i++) {
+          if (!visOk(f.vis, i) || !f.lm2[i]) continue;
+          sums[i].x += f.lm2[i].x; sums[i].y += f.lm2[i].y; sums[i].c++;
+        }
+      }
+      const means = sums.map((s) => (s.c ? { x: s.x / s.c, y: s.y / s.c } : null));
+      let sq = 0, sqc = 0;
+      for (const f of stillFrames) {
+        for (let i = 0; i < n; i++) {
+          if (!visOk(f.vis, i) || !f.lm2[i] || !means[i]) continue;
+          const dx = f.lm2[i].x - means[i].x, dy = f.lm2[i].y - means[i].y;
+          sq += dx * dx + dy * dy; sqc++;
+        }
+      }
+      if (sqc > 0) jitter.sigma2d = Math.sqrt(sq / sqc);
+    }
+    if (centroids.length >= 2) {
+      let sq = 0, sqc = 0;
+      for (let i = 1; i < centroids.length; i++) {
+        const a = centroids[i - 1], b = centroids[i];
+        const n = 33;
+        for (let k = 0; k < n; k++) {
+          if (!visOk(a.vis, k) || !visOk(b.vis, k) || !a.lm2[k] || !b.lm2[k]) continue;
+          const dx = b.lm2[k].x - a.lm2[k].x, dy = b.lm2[k].y - a.lm2[k].y;
+          sq += dx * dx + dy * dy; sqc++;
+        }
+      }
+      if (sqc > 0) jitter.rms2d = Math.sqrt(sq / sqc);
+    }
+
+    const verdicts = {
+      boneCV: verdictLte(boneCV.overall, TH.boneCV.passMax, TH.boneCV.warnMax),
+      symmetry: verdictLte(symmetry.overall, TH.symmetry.passMax, TH.symmetry.warnMax),
+      jitter: verdictLte(jitter.sigma2d, TH.jitterSigma.passMax, TH.jitterSigma.warnMax),
+      overall: "pass",
+    };
+    const detectVerdict = verdictGte(detectRate, TH.detectRate.passMin, TH.detectRate.warnMin);
+    verdicts.overall = worstVerdict(verdicts.boneCV, verdicts.symmetry, verdicts.jitter, detectVerdict);
+
+    return { fps, detectRate, boneCV, symmetry, jitter, angleViolations, verdicts };
+  }
+
+  // ===== 計測パネル描画 =====
+  function badgeText(v) { return v === "pass" ? "PASS" : v === "warn" ? "WARN" : v === "fail" ? "FAIL" : "–"; }
+  function setBadge(el, v) { el.textContent = badgeText(v); el.className = "badge " + (v || ""); }
+
+  function renderStatsPanel(m) {
+    statFpsEl.textContent = fmtNum(m.fps, 1);
+    statDetectEl.textContent = fmtPct(m.detectRate);
+    statBoneCVEl.textContent = fmtNum(m.boneCV.overall, 4);
+    statBoneWorstEl.textContent = m.boneCV.worst.bone ? (m.boneCV.worst.bone + " (" + fmtNum(m.boneCV.worst.cv, 4) + ")") : "–";
+    statSymmetryEl.textContent = fmtPct(m.symmetry.overall);
+    statJitterSigmaEl.textContent = fmtNum(m.jitter.sigma2d, 5);
+    statJitterRmsEl.textContent = fmtNum(m.jitter.rms2d, 5);
+    statAngleViolEl.textContent = String(m.angleViolations);
+
+    setBadge(badgeBoneCVEl, m.verdicts.boneCV);
+    setBadge(badgeSymmetryEl, m.verdicts.symmetry);
+    setBadge(badgeJitterEl, m.verdicts.jitter);
+    setBadge(overallBadgeEl, m.verdicts.overall);
+
+    fpsChipEl.textContent = fmtNum(m.fps, 0);
+    detectChipEl.textContent = fmtPct(m.detectRate, 0);
+    overallChipEl.textContent = badgeText(m.verdicts.overall);
+  }
+
+  setInterval(() => {
+    const m = computeMetrics();
+    renderStatsPanel(m);
+    if (running) {
+      statsLog.push({
+        t: (performance.now() - trackingStartedAt) / 1000,
+        fps: m.fps, detectRate: m.detectRate,
+        boneCVOverall: m.boneCV.overall, boneCVWorstBone: m.boneCV.worst.bone, boneCVWorstVal: m.boneCV.worst.cv,
+        symmetryOverall: m.symmetry.overall,
+        jitterSigma2d: m.jitter.sigma2d, jitterRms2d: m.jitter.rms2d,
+        angleViolations: m.angleViolations,
+        verdictBoneCV: m.verdicts.boneCV, verdictSymmetry: m.verdicts.symmetry, verdictJitter: m.verdicts.jitter, verdictOverall: m.verdicts.overall,
+      });
+    }
+  }, 1000);
+
+  // ===== 描画（映像とランドマークを同一の反転座標系で描く＝ミラーでズレない）=====
+  const POSE_CONNECTIONS = HolisticLandmarker.POSE_CONNECTIONS;
+  function connIndices(c) { return Array.isArray(c) ? c : [c.start, c.end]; }
+  function poseColor(v) {
+    if (v == null) return COLORS.cyan;
+    if (v >= 0.8) return COLORS.green;
+    if (v >= 0.5) return COLORS.yellow;
+    return COLORS.danger;
+  }
+
+  function drawPoseSkeleton(lm2) {
+    if (!lm2) return;
+    const w = canvas.width, h = canvas.height;
+    ctx.lineWidth = 3;
+    for (const c of POSE_CONNECTIONS) {
+      const [ai, bi] = connIndices(c);
+      const a = lm2[ai], b = lm2[bi];
+      if (!a || !b) continue;
+      const va = a.visibility == null ? 1 : a.visibility;
+      const vb = b.visibility == null ? 1 : b.visibility;
+      ctx.strokeStyle = poseColor(Math.min(va, vb));
+      ctx.beginPath();
+      ctx.moveTo(a.x * w, a.y * h);
+      ctx.lineTo(b.x * w, b.y * h);
+      ctx.stroke();
+    }
+    for (const p of lm2) {
+      if (!p) continue;
+      ctx.fillStyle = poseColor(p.visibility);
+      ctx.beginPath();
+      ctx.arc(p.x * w, p.y * h, 4, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  function drawResult(res) {
+    const pose = res.poseLandmarks && res.poseLandmarks[0];
+    const lh = res.leftHandLandmarks && res.leftHandLandmarks[0];
+    const rh = res.rightHandLandmarks && res.rightHandLandmarks[0];
+    if (pose) drawPoseSkeleton(pose);
+    if (lh && lh.length) {
+      du.drawConnectors(lh, HolisticLandmarker.HAND_CONNECTIONS, { color: COLORS.cyan, lineWidth: 2 });
+      du.drawLandmarks(lh, { color: COLORS.white, fillColor: COLORS.cyan, lineWidth: 1, radius: 2 });
+    }
+    if (rh && rh.length) {
+      du.drawConnectors(rh, HolisticLandmarker.HAND_CONNECTIONS, { color: COLORS.magenta, lineWidth: 2 });
+      du.drawLandmarks(rh, { color: COLORS.white, fillColor: COLORS.magenta, lineWidth: 1, radius: 2 });
+    }
+  }
+
+  function render() {
+    const w = canvas.width, h = canvas.height;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, w, h);
+
+    // 映像とランドマークを同一の（必要なら反転した）座標系で描く＝常にズレない（index.html L453-473のパターン踏襲）
+    ctx.save();
+    if (settings.mirror) { ctx.translate(w, 0); ctx.scale(-1, 1); }
+    if (settings.showVideo && video.videoWidth > 0) ctx.drawImage(video, 0, 0, w, h);
+    if (lastResult) drawResult(lastResult);
+    ctx.restore();
+  }
+
+  function updateFpsHud(now) {
+    fpsFrames++;
+    if (now - fpsT0 >= 500) {
+      fpsDisplay = Math.round((fpsFrames * 1000) / (now - fpsT0));
+      fpsT0 = now; fpsFrames = 0;
+    }
+  }
+
+  // ===== メインループ =====
+  function loop() {
+    if (!running) return;
+    rafId = requestAnimationFrame(loop);
+    const now = performance.now();
+
+    if (holistic && video.videoWidth > 0 && video.currentTime !== lastVideoTime) {
+      lastVideoTime = video.currentTime;
+      let res = null;
+      try {
+        res = holistic.detectForVideo(video, now);
+      } catch (e) {
+        console.error("detectForVideo", e);
+      }
+      processFrame(res, now);
+      if (firstFrameResolve) { const r = firstFrameResolve; firstFrameResolve = null; r(); }
+    }
+
+    render();
+    updateFpsHud(now);
+  }
+
+  // ===== 記録（__record/__dump）=====
+  function setRecording(on) {
+    recording = !!on;
+    if (recording) {
+      recordBuffer = [];
+      recordTotalTicks = 0;
+      recordDetectedTicks = 0;
+      recordMeta = { width: canvas.width || video.videoWidth || 0, height: canvas.height || video.videoHeight || 0, startedAt: performance.now() };
+    }
+    recordBtn.textContent = recording ? "■ 記録停止" : "● 記録開始";
+    recordBtn.classList.toggle("active", recording);
+    recChipEl.textContent = recording ? "on" : "off";
+  }
+  recordBtn.addEventListener("click", () => setRecording(!recording));
+
+  function dump() {
+    const note = "t は記録開始(meta.startedAt)からの相対ミリ秒。videoTimeMs は video.currentTime*1000で、" +
+      "フェイクカメラの場合ソース動画のループ再生上の実位置(record()呼び出しでリセットされない" +
+      "ライブ映像的な単調増加値)。Python側extract.pyのtMs(動画ファイル先頭=0msの絶対位置)と" +
+      "時刻対応付けする際はvideoTimeMs mod クリップ長を使うこと(tはrecord開始基準で" +
+      "エポックが異なるため直接比較不可。compare.py参照)。" +
+      "framesは検出成功フレームのみを含む(33要素固定shapeを保つ設計)ため、" +
+      "frames.lengthを分母にした検出率は水増しされる。真の検出率は totalTicks/detectedTicks から計算すること。";
+    return {
+      meta: recordMeta
+        ? { ...recordMeta, totalTicks: recordTotalTicks, detectedTicks: recordDetectedTicks, note }
+        : { width: 0, height: 0, startedAt: 0, totalTicks: 0, detectedTicks: 0, note },
+      frames: recordBuffer.slice(),
+    };
+  }
+
+  // ===== CSV / スナップショット =====
+  function exportStatsCsv() {
+    if (statsLog.length === 0) return;
+    const cols = ["t", "fps", "detectRate", "boneCVOverall", "boneCVWorstBone", "boneCVWorstVal", "symmetryOverall", "jitterSigma2d", "jitterRms2d", "angleViolations", "verdictBoneCV", "verdictSymmetry", "verdictJitter", "verdictOverall"];
+    let csv = cols.join(",") + "\n";
+    for (const r of statsLog) {
+      csv += cols.map((c) => {
+        const v = r[c];
+        if (v == null) return "";
+        return typeof v === "number" ? (isFinite(v) ? v.toFixed(5) : "") : String(v);
+      }).join(",") + "\n";
+    }
+    const blob = new Blob([csv], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "verify-stats-" + new Date().toISOString().replace(/[:.]/g, "-") + ".csv";
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+  csvBtn.addEventListener("click", exportStatsCsv);
+
+  snapBtn.addEventListener("click", () => {
+    const a = document.createElement("a");
+    a.download = "verify-" + new Date().toISOString().replace(/[:.]/g, "-") + ".png";
+    a.href = canvas.toDataURL("image/png");
+    a.click();
+  });
+
+  // ===== トグル =====
+  function bindToggle(el, key) {
+    const apply = () => {
+      const on = !(el.getAttribute("aria-pressed") === "true");
+      el.setAttribute("aria-pressed", String(on));
+      settings[key] = on;
+    };
+    el.addEventListener("click", apply);
+    el.addEventListener("keydown", (e) => { if (e.key === " " || e.key === "Enter") { e.preventDefault(); apply(); } });
+  }
+  bindToggle(tglMirror, "mirror");
+  bindToggle(tglVideo, "showVideo");
+
+  toggleCamBtn.addEventListener("click", () => {
+    if (running) { stop(); return; }
+    start().catch((e) => console.error("start() failed", e));
+  });
+
+  // ===== ヘッドレス検証用フックAPI（CONTRACT.md ストリーム1節のシグネチャに準拠）=====
+  window.__ready = false;
+  window.__start = start;
+  window.__stop = stop;
+  window.__record = setRecording;
+  window.__dump = dump;
+  window.__stats = computeMetrics;
+
+  // ===== 初期化 =====
+  paintIdleBackground();
+
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    insecureEl.style.display = "block";
+    insecureEl.innerHTML = location.protocol === "file:"
+      ? "⚠️ <b>file:// では動作しません。</b>ターミナルでこのフォルダに移動し <code>python3 -m http.server 8000</code> を実行、<code>http://localhost:8000/verify.html</code> を開いてください。"
+      : "⚠️ このコンテキストではカメラを使用できません。<code>http://localhost</code> または <code>https://</code> で開いてください。";
+  }
+
+  (async () => {
+    try {
+      await ensureHolistic();
+      window.__ready = true;
+      toggleCamBtn.disabled = false;
+      setStatus("idle", "「トラッキング開始」を押してください", "ブラウザがカメラの使用許可を求めます。「許可」を選んでください。");
+    } catch (e) {
+      console.error("Holisticモデルの初期化に失敗しました:", (e && e.stack) || e);
+      setStatus("error", "モデルの読み込みに失敗しました", String(e && e.message || e));
+    }
+  })();
+</script>
