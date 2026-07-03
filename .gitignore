@@ -6,3 +6,4 @@ test/tracking/media/
 test/tracking/out/
 test/tracking/crosscheck/.venv/
 test/sim/out/
+__pycache__/
