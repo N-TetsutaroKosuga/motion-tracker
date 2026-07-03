@@ -533,24 +533,38 @@ const CASES = [
     },
   },
   {
+    // f1タスク: visibilityゲートのヒステリシス化(VIS_GATE_MIN=凍結開始/VIS_GATE_EXIT=凍結解除)後の
+    // 新仕様に合わせて更新。Phase Aは「凍結開始域(0.45)→ヒステリシスの中間帯(0.55、旧VIS_GATE_MIN=0.5
+    // より高いが新VIS_GATE_EXIT=0.6未満)」の2段階に変更し、中間帯でも凍結が解除されない
+    // (=旧・単一閾値0.5の実装なら0.55で解除されてしまいFAILするはずの)ことを確認する形にした。
+    // ヒステリシスの境界そのもの(enter/exit)を単独で検証する専用ケースは new-vis-hysteresis を参照。
     id: "new-visibility-gate",
     desc:
-      "__simVis: reach45収束後に肘vis=0.2へ落とした変形ポーズに切替→elbowZが直前値付近に保持(ゲート)。" +
-      "vis=1なら新姿勢(tpose, elbowZ≈0)へ追従する対比",
+      "__simVis: reach45収束後にvis=0.45→0.55(ヒステリシスの中間帯)へ落とした変形ポーズに切替→" +
+      "elbowZが直前値付近に保持され続ける(ゲート、中間帯でも解除されない)。vis=1なら新姿勢(tpose, elbowZ≈0)へ追従する対比",
     requiredHooks: ["__resetCalibration", "__setManualCal", "__simVis", "__zProbe"],
     async run(page) {
-      // Phase A: vis=0.2でゲートがelbowZを保持することを確認
+      // Phase A: vis=0.45(凍結開始)→0.55(ヒステリシス中間帯、旧VIS_GATE_MIN=0.5超だが
+      // 新VIS_GATE_EXIT=0.6未満)でelbowZが保持され続けることを確認
       await resetAndCal(page);
       await evalHook(page, "__simVis", ["reach45", {}]);
       const conv1 = await pollUntilStable(page);
       const before = conv1.probe?.left?.elbowZ ?? null;
-      await evalHook(page, "__simVis", ["tpose", { 13: 0.2 }]);
-      const samples = [];
-      for (let i = 0; i < 5; i++) {
+      await evalHook(page, "__simVis", ["tpose", { 13: 0.45 }]);
+      const samplesEnter = [];
+      for (let i = 0; i < 3; i++) {
         await sleep(100);
         const pr = await page.evaluate(() => window.__zProbe());
-        samples.push(pr?.left?.elbowZ ?? null);
+        samplesEnter.push(pr?.left?.elbowZ ?? null);
       }
+      await evalHook(page, "__simVis", ["tpose", { 13: 0.55 }]);
+      const samplesMid = [];
+      for (let i = 0; i < 3; i++) {
+        await sleep(100);
+        const pr = await page.evaluate(() => window.__zProbe());
+        samplesMid.push(pr?.left?.elbowZ ?? null);
+      }
+      const samples = [...samplesEnter, ...samplesMid];
       const gatedMaxDrift = Math.max(...samples.map((v) => (v == null || before == null ? Infinity : Math.abs(v - before))));
 
       // Phase B: vis=1なら新姿勢に追従する対比
@@ -571,7 +585,7 @@ const CASES = [
       const freeNearZero = result.after2 != null && Math.abs(result.after2 - 0) < 0.05;
       const pass = gatedHolds && freeMoves && freeNearZero;
       const detail =
-        `before=${fmt(result.before)} gatedSamples=[${result.samples.map(fmt).join(", ")}] gatedMaxDrift=${fmt(result.gatedMaxDrift)} / ` +
+        `before=${fmt(result.before)} gatedSamples(vis0.45→0.55)=[${result.samples.map(fmt).join(", ")}] gatedMaxDrift=${fmt(result.gatedMaxDrift)} / ` +
         `before2=${fmt(result.before2)} after2(vis=1)=${fmt(result.after2)} movedDelta=${fmt(result.movedDelta)}`;
       return {
         pass,
@@ -585,6 +599,167 @@ const CASES = [
         assumption: '__simVis(baseName, visMap) の baseName に "reach45"(=buildPoseReach(45)相当)・"tpose" が存在する前提',
         "reach45理論elbowZ": reachElbowZ(45).toFixed(4),
         "tpose理論elbowZ": "0.0000 (lE=Uちょうどのためzmag=0)",
+        note: "vis=0.45→0.55(ヒステリシスの中間帯)の2段階で凍結が解除されないことを確認する(f1タスク仕様変更)",
+      };
+    },
+  },
+  {
+    // f1タスク新規ケース: VIS_GATE_MIN(凍結開始)/VIS_GATE_EXIT(凍結解除)のヒステリシス境界そのものを
+    // vis=0.45→0.55→0.65と振って直接検証する(CONTRACT.md該当行の例に対応)。
+    // 既定値は VIS_GATE_MIN=0.5, VIS_GATE_EXIT=0.6 (avatar-depth.html HZ定数)。
+    id: "new-vis-hysteresis",
+    desc:
+      "__simVis: vis=0.45(<ENTER)で凍結開始→0.55(ENTER<vis<EXIT、中間帯)で凍結維持→" +
+      "0.65(>EXIT)で凍結解除、の3段階を__zProbeで直接確認",
+    requiredHooks: ["__resetCalibration", "__setManualCal", "__simVis", "__zProbe"],
+    async run(page) {
+      await resetAndCal(page);
+      await evalHook(page, "__simVis", ["reach45", {}]);
+      const conv0 = await pollUntilStable(page);
+      const before = conv0.probe?.left?.elbowZ ?? null;
+
+      const sampleFor = async (visMap, n = 3) => {
+        await evalHook(page, "__simVis", ["tpose", visMap]);
+        const out = [];
+        for (let i = 0; i < n; i++) {
+          await sleep(100);
+          const pr = await page.evaluate(() => window.__zProbe());
+          out.push(pr?.left?.elbowZ ?? null);
+        }
+        return out;
+      };
+
+      const stepEnter = await sampleFor({ 13: 0.45 }); // < VIS_GATE_MIN(0.5) => 凍結開始
+      const stepMid = await sampleFor({ 13: 0.55 });   // ENTER<vis<EXIT => 凍結維持(ヒステリシス本体)
+      const stepExit = await sampleFor({ 13: 0.65 }, 10); // > VIS_GATE_EXIT(0.6) => 凍結解除、tpose理論値(≈0)へ追従
+
+      return { before, stepEnter, stepMid, stepExit };
+    },
+    assert(result) {
+      const drift = (arr) => Math.max(...arr.map((v) => (v == null || result.before == null ? Infinity : Math.abs(v - result.before))));
+      const enterHolds = Number.isFinite(drift(result.stepEnter)) && drift(result.stepEnter) < 0.02;
+      const midHolds = Number.isFinite(drift(result.stepMid)) && drift(result.stepMid) < 0.02;
+      const exitLast = result.stepExit[result.stepExit.length - 1];
+      const released = exitLast != null && Math.abs(exitLast - 0) < 0.05; // tpose理論elbowZ=0
+      const pass = enterHolds && midHolds && released;
+      const detail =
+        `before=${fmt(result.before)} / enter(vis0.45)=[${result.stepEnter.map(fmt).join(",")}] holds=${enterHolds} / ` +
+        `mid(vis0.55)=[${result.stepMid.map(fmt).join(",")}] holds=${midHolds} / ` +
+        `exit(vis0.65)=[${result.stepExit.map(fmt).join(",")}] released(last≈0)=${released}`;
+      return {
+        pass,
+        detail,
+        actual: result,
+        expected: { enterHoldsDrift: "<0.02", midHoldsDrift: "<0.02(旧単一閾値なら0.5を超えているため解除されFAILするはず)", exitLastNearZero: "±0.05" },
+      };
+    },
+    dryRunPreview() {
+      return {
+        note:
+          "HZ.VIS_GATE_MIN=0.5(凍結開始)/HZ.VIS_GATE_EXIT=0.6(凍結解除)の既定値を前提。" +
+          "vis=0.45→凍結開始、0.55→(0.5より上だが0.6未満のため)凍結維持、0.65→(0.6超のため)凍結解除でtpose理論値(elbowZ≈0)へ追従。",
+        "reach45理論elbowZ(開始点)": reachElbowZ(45).toFixed(4),
+        "tpose理論elbowZ(解除後の収束先)": "0.0000",
+      };
+    },
+  },
+  {
+    // f1タスク新規ケース: 較正結果のフィードバック(__calProbe)。tposeフィクスチャは
+    // leftHandLandmarks/rightHandLandmarksを持たない(既存4ポーズ共通の仕様、testSurface.md §1)ため、
+    // 手動較正(#calBtnクリック→startManualCalibration/stepManualCalibration)を走らせると
+    // 骨長・肩幅は測定できるが手サイズだけが構造的に欠損するはず。この「部分的成功」を
+    // __calProbe()が正しく項目別に報告できることを確認する(CONTRACT.md検証手順d)。
+    // 他ケースと異なり__setManualCal は呼ばない(較正フローそのものを素の状態からテストするため)。
+    id: "new-calibration-feedback-handmissing",
+    desc: "tposeフィクスチャで手動較正を実行→__calProbe(): 骨長/肩幅はok、手サイズは左右ともmissingと報告される",
+    requiredHooks: ["__resetCalibration", "__simPose", "__calProbe"],
+    async run(page) {
+      await evalHook(page, "__resetCalibration", []);
+      await evalHook(page, "__simPose", ["tpose"]);
+      const hasCalBtn = await page.evaluate(() => !!document.getElementById("calBtn"));
+      if (!hasCalBtn) {
+        const e = new Error("#calBtn が見つからない(手動較正UIが無い)");
+        e.hookMissing = true;
+        throw e;
+      }
+      await page.click("#calBtn");
+      // MANUAL_CAL_MS(3000ms、performance.now()基準の実時間)+ 余裕分を待つ
+      await sleep(3500);
+      const probe = await page.evaluate(() => window.__calProbe());
+      return { probe };
+    },
+    assert(result) {
+      const p = result.probe;
+      if (!p) return { pass: false, detail: "__calProbe()がnull(較正が完了していない)", actual: p };
+      const boneOk = p.ok?.bone === true;
+      const shoulderOk = p.ok?.shoulder === true;
+      const handMissing = p.ok?.handLeft === false && p.ok?.handRight === false;
+      const missingHasHands = p.missing?.includes("handLeft") && p.missing?.includes("handRight");
+      const pass = boneOk && shoulderOk && handMissing && missingHasHands;
+      const detail =
+        `ok=${JSON.stringify(p.ok)} missing=${JSON.stringify(p.missing)} samples=${JSON.stringify(p.samples)} adopted.L_ua/L_fa=${fmt(p.adopted?.L_ua)}/${fmt(p.adopted?.L_fa)}`;
+      return {
+        pass,
+        detail,
+        actual: p,
+        expected: { boneOk: true, shoulderOk: true, handLeftOk: false, handRightOk: false, missingIncludes: ["handLeft", "handRight"] },
+      };
+    },
+    dryRunPreview() {
+      return {
+        note:
+          "buildPose系フィクスチャ(tpose含む)はleftHandLandmarks/rightHandLandmarksを持たない仕様" +
+          "(testSurface.md §1)。手動較正は骨長(11-13-15/12-14-16)・肩幅(11-12)は手に依存せず取得できるが、" +
+          "手サイズ(handSizeMetrics)はhand[0]が無いためmatchHandsToWrists()が常にnullを返し、" +
+          "構造的に欠損し続けるはず。",
+        "tpose理論L_ua/L_fa": "0.2700 / 0.2500 (buildPoseのtpose座標がU=0.27,F=0.25と厳密に一致するため)",
+      };
+    },
+  },
+  {
+    // f1タスク新規ケース: 手動較正の画面平行性ゲート(stepManualCalibrationのCAL_NEAR_MAX_RATIOフィルタ)。
+    // tpose(画面平行)の収集中に reach45相当の大きく前傾した姿勢(__simReachLR(80,80)、2D投影が
+    // 大きく縮む)を一時的に混入させ、そのフレームがサンプルとして採用されず、最終的な
+    // L_ua/L_faがtposeの理論値(U=0.27/F=0.25)付近に留まる(=混入姿勢に汚染されない)ことを確認する。
+    // d2診断が実測した「手動較正は自動較正より悪化しうる(0.28→0.173まで過小)」バグの再発防止テスト。
+    id: "new-calibration-parallelism-gate",
+    desc: "手動較正中にreach45相当の非平行姿勢を混入→CAL_NEAR_MAX_RATIOで棄却され、L_ua/L_faがtpose理論値付近に留まる",
+    requiredHooks: ["__resetCalibration", "__simPose", "__simReachLR", "__calProbe"],
+    async run(page) {
+      await evalHook(page, "__resetCalibration", []);
+      await evalHook(page, "__simPose", ["tpose"]);
+      await page.click("#calBtn");
+      await sleep(900); // tpose(画面平行)のサンプルでランニング最大2D長を先に確立させる
+      await evalHook(page, "__simReachLR", [80, 80]); // 大きく前傾した非平行姿勢を混入
+      await sleep(600);
+      await evalHook(page, "__simPose", ["tpose"]); // 平行姿勢に戻す
+      await sleep(2200); // 合計3000ms(MANUAL_CAL_MS)を超えるまで待つ
+      const probe = await page.evaluate(() => window.__calProbe());
+      return { probe };
+    },
+    assert(result) {
+      const p = result.probe;
+      if (!p) return { pass: false, detail: "__calProbe()がnull(較正が完了していない)", actual: p };
+      const boneOk = p.ok?.bone === true;
+      const uaOk = within(p.adopted?.L_ua, 0.27, 0.1, "rel");
+      const faOk = within(p.adopted?.L_fa, 0.25, 0.1, "rel");
+      const notContaminated = uaOk && faOk; // 混入姿勢の見かけ長(理論上tposeの約1/5)に汚染されていないこと
+      const pass = boneOk && notContaminated;
+      const detail =
+        `ok.bone=${boneOk} adopted.L_ua=${fmt(p.adopted?.L_ua)}(理論0.27, ±10%) adopted.L_fa=${fmt(p.adopted?.L_fa)}(理論0.25, ±10%) samples=${JSON.stringify(p.samples)}`;
+      return {
+        pass,
+        detail,
+        actual: p,
+        expected: { boneOk: true, L_ua: "0.27±10%", L_fa: "0.25±10%" },
+      };
+    },
+    dryRunPreview() {
+      return {
+        note:
+          "__simReachLR(80,80)のlm2投影2D長はtposeの約17%(cos80°≈0.174)まで縮むため、" +
+          "CAL_NEAR_MAX_RATIO=0.92のゲートで確実に棄却されるはず(0.174 < 0.92)。" +
+          "棄却が機能していれば最終L_ua/L_faはtpose理論値0.27/0.25付近に留まる。",
       };
     },
   },

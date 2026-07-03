@@ -165,6 +165,7 @@
         <button class="btn-ghost active" data-zmethod="hybrid" title="骨長短縮で大きさ・深度/生zで符号を決める新方式">ハイブリッド</button>
       </div>
       <button id="calBtn" class="btn-ghost" style="margin-top:8px; width:100%">📐 キャリブレーション（Tポーズ3秒）</button>
+      <pre id="calStatus" class="note" style="display:none; margin:8px 0 0; white-space:pre-line; font-family:inherit;"></pre>
     </div>
 
     <div>
@@ -249,6 +250,7 @@
   const depthDbgCtx = depthDbg.getContext("2d");
   const zMethodBtns = [...document.querySelectorAll("[data-zmethod]")];
   const calBtn = document.getElementById("calBtn");
+  const calStatusEl = document.getElementById("calStatus");
   const tglHandAnchor = document.getElementById("tglHandAnchor");
 
   // ===== 状態 =====
@@ -296,10 +298,26 @@
     FLIP_ZMAG_THRESH: 0.05,  // zMag[m]がこれ未満(=体側平面通過付近)のときのみ符号反転を許可
     REF_EMA_TAU: 1.0,        // スケール/シフト整合の参照点EMA時定数[s]
     REF_VIS_MIN: 0.5,        // スケール/シフト整合の参照点に使う最低visibility
-    VIS_GATE_MIN: 0.5,       // 腕ランドマークzゲートの最低visibility
+    // 腕ランドマークzゲート：ヒステリシス化(f1タスク)。旧仕様は VIS_GATE_MIN 単一閾値で
+    // 「vis<しきい値なら凍結」を毎フレーム再判定していたため、d2実測(punch映像t=6.1〜8.0s帯、
+    // 右肘visが0.51→0.26→0.44のように0.5付近を往復)で凍結/再開が数百ms間隔で点滅し、
+    // アバターの腕が小刻みに固まったり動いたりする不自然な挙動を生んでいた。
+    // resolveSignのSIGN_HI/LOと同じSchmittトリガー方式にし、「凍結開始」と「凍結解除」を
+    // 別閾値にすることで境界付近の微小変動による点滅を抑える。
+    VIS_GATE_MIN: 0.5,       // 凍結"開始"閾値：非凍結中にこれを下回ったら凍結する
+    VIS_GATE_EXIT: 0.6,      // 凍結"解除"閾値：凍結中はこれを上回るまで凍結を維持する(必ずVIS_GATE_MIN以上にすること)
     VIS_EPS: 0.02,           // visibility「利用不可」判定の閾値（0.10.35は欠損時0を返すため）
     VIS_UNAVAILABLE_MS: 2000,// この時間だけ全点visibility~0が続いたらゲート自動無効化
-    ARM_SLERP_MIN: 0.15,     // 低visibility時、腕slerp係数を最大どこまで縮小するか（倍率下限）
+    // 低visibility時、腕slerp係数を最大どこまで縮小するか（倍率下限）。
+    // 旧値0.15は「腕がほぼ静止したまま体幹だけ動く」置き去り挙動の主因だった(d2実測)。
+    // punch.y4mでの実測A/Bテスト(test/tracking/probe-avatar.mjs、__armProbeの100msあたり
+    // ジャンプp95、3回反復×複数候補、本タスクf1報告の表参照)では、0.2〜0.3の範囲で
+    // ジャンプp95がbaseline(0.15)比おおむね10%前後減少する一方、0.35以上に上げると
+    // 改善が消え悪化する候補もあった(低vis時の破綻座標=d1実測のボーン長±50〜70%振動を
+    // 素通しする副作用が追従性向上のメリットを上回り始めるため)。実測分布の中央値付近を
+    // 取り0.25とした（「置き去りの緩和」と「破綻座標由来のジッター増幅の抑制」の実測上の折衷点。
+    // z自体はgatedFuseWrite側のヒステリシスゲートで別途保護されている）。
+    ARM_SLERP_MIN: 0.25,
     SAG_DEADZONE: 0.14,      // 矢状角の不感帯[rad]
     SAG_MAX_RATE: 0.25,      // 矢状角のフレームあたり最大変化量[rad]
   };
@@ -311,6 +329,13 @@
   window.__setFallbackThresh = (v) => { HZ.FALLBACK_THRESH = v; };
   window.__setFlipGate = (v) => { HZ.FLIP_ZMAG_THRESH = v; };
   window.__setSagLimits = (deadzone, maxRate) => { HZ.SAG_DEADZONE = deadzone; HZ.SAG_MAX_RATE = maxRate; };
+  // ヘッドレス検証用: visibilityゲートのヒステリシス閾値(enter/exit)を実行時調整する。
+  // 引数省略(null/undefined)の側は変更しない。
+  window.__setVisGate = (enterMin, exitMin) => {
+    if (enterMin != null) HZ.VIS_GATE_MIN = enterMin;
+    if (exitMin != null) HZ.VIS_GATE_EXIT = exitMin;
+  };
+  window.__setArmSlerpMin = (v) => { if (v != null) HZ.ARM_SLERP_MIN = v; };
 
   // ---- 手アンカー方式（前方リーチ強化）: 数値定数 ----
   // 前方リーチで腕の2D投影が点に潰れ zMag が骨長飽和する問題への対策。
@@ -349,11 +374,22 @@
   let calStatus = "default";    // "default" | "auto" | "manual"
   const calBuf = { ua2d: 0, fa2d: 0, uaSamples: [], faSamples: [] };
   const CAL_SAMPLE_MAX = 90;       // 直近サンプル数（中央値の母集団）
-  const CAL_NEAR_MAX_RATIO = 0.92; // ランニング最大2D長のこの比率以上のフレームだけ採用＝画面平行に近い
+  let CAL_NEAR_MAX_RATIO = 0.92;   // ランニング最大2D長のこの比率以上のフレームだけ採用＝画面平行に近い(自動・手動較正共通、__setCalNearMaxRatioで調整可)
   // ランニング最大2D長(calBuf.ua2d/fa2d)の毎フレーム減衰率。減衰させないと、MediaPipeの一瞬の
   // グリッチで異常に大きい値が一度記録されただけで、以後の正常なサンプルが全てCAL_NEAR_MAX_RATIO判定で
   // 棄却され続け、自動較正が恒久的に停止してしまう。スローに減衰させることで数十秒~数分オーダーで回復させる。
   const CAL_MAX_DECAY = 0.999;
+  window.__setCalNearMaxRatio = (v) => { if (v > 0 && v <= 1) CAL_NEAR_MAX_RATIO = v; };
+  // 自動骨長較正のドリフトクランプ(f1タスク): L_ua/L_faが「較正開始時点の基準値」から
+  // ±CAL_DRIFT_CLAMP_RATIO を超えて漂流しないようにする。基準値はupdateBoneCalibrationが
+  // 初めて実行された時点のL_ua/L_fa(calRefUa/calRefFa、__resetCalibration()の直後ならデフォルト値
+  // 0.28/0.25、事前に__setManualCal等で別の基準を与えていればその値)をその場でスナップショットする
+  // ("基準値(デフォルトまたはmanual設定値)"というf1タスク仕様どおり)。
+  // d2実測: パンチ映像でL_ua/L_faが74%まで過小推定され、zMagがsqrt(L²-l2D²)の飽和/非飽和境界を
+  // 頻繁にまたぐことでsign反転が8回発生していたが、クランプを効かせると同映像でsign反転0回になった。
+  let CAL_DRIFT_CLAMP_RATIO = 0.2; // ±20%
+  window.__setCalDriftClamp = (ratio) => { if (ratio > 0) CAL_DRIFT_CLAMP_RATIO = ratio; };
+  let calRefUa = null, calRefFa = null; // 較正開始時点のL_ua/L_faスナップショット(ドリフトクランプの基準)
 
   // ---- 手アンカー方式：較正状態 ----
   // d09_0/d517_0は左右別（キーは15=left/16=right、腕チェーンと同じ規約）。W_m/w_nは肩幅の較正値（左右共通）。
@@ -378,6 +414,7 @@
   let latestDepthRaw = null;       // out.predicted_depth を軽量化した {H,W,data}
   let latestDepthSampleLm2 = null; // レイテンシ補償: 深度推論開始時刻に最も近い2D座標スナップショット
   let lastFusedWorld = null;       // __zProbe 用に直近の融合済みworldを保持
+  let lastRawWorldZ = null;        // __visProbe用: fuseArmZが上書きする直前の生world zを11-16分だけ保持（読み取り専用）
   // ヘッドレス検証用フェイク深度: (nx,ny)=>number|null を渡すと depthAvailable()/depthWindowValues() が
   // 実深度AIの代わりにこれを参照する（未設定時は既存の実カメラ経路と完全に同一の分岐のまま）。
   let fakeDepthFn = null;
@@ -805,6 +842,8 @@
   // world.x,yの距離のサンプルとして採用し、ランニング中央値でLを更新する。
   function updateBoneCalibration(world, lm2) {
     if (calStatus === "manual") return; // 明示較正済みなら自動更新で上書きしない
+    if (calRefUa == null) calRefUa = L_ua; // ドリフトクランプの基準値を初回実行時にスナップショット
+    if (calRefFa == null) calRefFa = L_fa;
     calBuf.ua2d *= CAL_MAX_DECAY; calBuf.fa2d *= CAL_MAX_DECAY; // グリッチ由来の異常値をスローに忘れる
     for (const [aI, bI, key] of [[11, 13, "ua"], [12, 14, "ua"], [13, 15, "fa"], [14, 16, "fa"]]) {
       if (!visOk(world, aI) || !visOk(world, bI)) continue;
@@ -819,21 +858,40 @@
       arr.push(l3);
       if (arr.length > CAL_SAMPLE_MAX) arr.shift();
     }
-    const mUa = median(calBuf.uaSamples), mFa = median(calBuf.faSamples);
+    const mUaRaw = median(calBuf.uaSamples), mFaRaw = median(calBuf.faSamples);
+    // ドリフトクランプ：基準値の±CAL_DRIFT_CLAMP_RATIO内に強制する(過小/過大推定の暴走を防止)
+    const mUa = mUaRaw != null ? clamp(mUaRaw, calRefUa * (1 - CAL_DRIFT_CLAMP_RATIO), calRefUa * (1 + CAL_DRIFT_CLAMP_RATIO)) : null;
+    const mFa = mFaRaw != null ? clamp(mFaRaw, calRefFa * (1 - CAL_DRIFT_CLAMP_RATIO), calRefFa * (1 + CAL_DRIFT_CLAMP_RATIO)) : null;
     if (mUa) { L_ua = mUa; if (calStatus === "default") calStatus = "auto"; }
     if (mFa) { L_fa = mFa; if (calStatus === "default") calStatus = "auto"; }
   }
+  // 手動較正(Tポーズ3秒)専用のランニング最大2D長バッファ(画面平行性ゲート用)。
+  // 自動較正(calBuf)とは独立させる：収集ウィンドウが3秒と短く、セッションをまたいで
+  // 減衰させ続ける必要がないため毎回startManualCalibrationでゼロリセットする。
+  const manualCalBuf = { ua2d: 0, fa2d: 0 };
   function startManualCalibration() {
     manualCalActive = true; manualCalT0 = performance.now(); manualCalUA = []; manualCalFA = [];
     manualCalD09[15] = []; manualCalD09[16] = []; manualCalD517[15] = []; manualCalD517[16] = [];
     manualCalWm.length = 0; manualCalWn.length = 0;
+    manualCalBuf.ua2d = 0; manualCalBuf.fa2d = 0;
     if (calBtn) { calBtn.textContent = "📐 収集中… 0%"; calBtn.disabled = true; }
   }
+  // f1タスク: 自動較正(updateBoneCalibration)にはあった画面平行性ゲート(CAL_NEAR_MAX_RATIO、
+  // 「ランニング最大2D長のX%以上のフレームだけ採用=画面に対しほぼ平行な姿勢だけ採用」)が
+  // 手動較正には無く、無条件にサンプルを採取していたバグ的挙動を修正。パンチ中のような
+  // 大きく前傾した腕の姿勢がそのまま「上腕/前腕長」として採用されてしまい(d2実測: 62%まで過小)、
+  // 自動較正より悪化するという逆効果を生んでいた。同じCAL_NEAR_MAX_RATIO定数を流用することで
+  // 自動/手動で判定基準を揃える(__setCalNearMaxRatioで両方に反映される)。
   function stepManualCalibration(world, lm2, lHand, rHand, vid, now) {
     if (!manualCalActive || !world) return;
     const elapsed = now - manualCalT0;
-    for (const [aI, bI, arr] of [[11, 13, manualCalUA], [12, 14, manualCalUA], [13, 15, manualCalFA], [14, 16, manualCalFA]]) {
+    for (const [aI, bI, key, arr] of [[11, 13, "ua", manualCalUA], [12, 14, "ua", manualCalUA], [13, 15, "fa", manualCalFA], [14, 16, "fa", manualCalFA]]) {
       if (!visOk(world, aI) || !visOk(world, bI)) continue;
+      const d2 = seg2DLen(lm2, aI, bI);
+      if (d2 == null) continue;
+      const maxKey = key + "2d";
+      if (d2 > manualCalBuf[maxKey]) manualCalBuf[maxKey] = d2;
+      else if (manualCalBuf[maxKey] > 0 && d2 < manualCalBuf[maxKey] * CAL_NEAR_MAX_RATIO) continue; // 前後方向を向いている可能性→棄却
       const l3 = seg3DLenXY(world, aI, bI);
       if (l3 != null) arr.push(l3);
     }
@@ -873,7 +931,50 @@
         }));
       } catch (e) { /* 保存不可でも較正結果自体は継続利用 */ }
       if (calBtn) { calBtn.textContent = "📐 キャリブレーション（Tポーズ3秒）"; calBtn.disabled = false; }
+      recordCalResult({ mUa, mFa, md09L, md09R, md517L, md517R, mWm, mWn });
     }
+  }
+  // f1タスク: 較正結果のフィードバック(サイレント失敗の解消)。
+  // 何が採用され何が欠損したまま既定値/未較正のままなのかをUIに出す。
+  // 「骨長は較正できたが手サイズは検出できなかった」ケース(punch.y4m含む多くの実映像で発生)が
+  // 従来はcalBtnのテキストが元に戻るだけで一切UIに出ず、ユーザーは手アンカーが機能しない理由を
+  // 知る術がなかった("サイレント失敗")。
+  let lastCalResult = null; // __calProbe用に保持(読み取り専用)
+  function recordCalResult({ mUa, mFa, md09L, md09R, md517L, md517R, mWm, mWn }) {
+    const boneOk = mUa != null && mFa != null;
+    const handLOk = md09L != null || md517L != null;
+    const handROk = md09R != null || md517R != null;
+    const shoulderOk = mWm != null && mWn != null;
+    const missing = [];
+    if (!boneOk) missing.push("bone");
+    if (!handLOk) missing.push("handLeft");
+    if (!handROk) missing.push("handRight");
+    if (!shoulderOk) missing.push("shoulder");
+    lastCalResult = {
+      timestamp: Date.now(),
+      samples: { ua: manualCalUA.length, fa: manualCalFA.length, handLeft: manualCalD09[15].length, handRight: manualCalD09[16].length, shoulder: manualCalWm.length },
+      adopted: { L_ua, L_fa, handCal: { d09_0: { ...handCal.d09_0 }, d517_0: { ...handCal.d517_0 }, W_m: handCal.W_m, w_n: handCal.w_n } },
+      ok: { bone: boneOk, handLeft: handLOk, handRight: handROk, shoulder: shoulderOk },
+      missing,
+    };
+    renderCalStatus(lastCalResult);
+  }
+  // ヘッドレス検証用（読み取り専用）: 直近の較正結果サマリ(収集サンプル数・採用値・欠損項目)を返す。
+  // 較正を一度も完走していなければnull。
+  window.__calProbe = () => (lastCalResult ? JSON.parse(JSON.stringify(lastCalResult)) : null);
+  function renderCalStatus(r) {
+    if (!calStatusEl) return;
+    if (!r) { calStatusEl.style.display = "none"; calStatusEl.textContent = ""; return; }
+    const okMark = (b) => (b ? "○" : "×");
+    const boneLine = r.ok.bone
+      ? `骨長: 測定済み(L_ua=${r.adopted.L_ua.toFixed(2)}/L_fa=${r.adopted.L_fa.toFixed(2)})`
+      : `骨長: サンプル不足で既定値のまま(L_ua=${r.adopted.L_ua.toFixed(2)}/L_fa=${r.adopted.L_fa.toFixed(2)})`;
+    const handLine = `手サイズ較正: 左${okMark(r.ok.handLeft)}/右${okMark(r.ok.handRight)}`;
+    const shoulderLine = `肩幅: ${okMark(r.ok.shoulder)}`;
+    const lines = [boneLine, handLine, shoulderLine];
+    if (r.missing.length) lines.push("→ カメラから離れて手まで映る状態で再試行してください。");
+    calStatusEl.textContent = lines.join("\n");
+    calStatusEl.style.display = "block";
   }
 
   // ---- 手アンカー方式：ヘルパー（手⇔ポーズのマッチング、手サイズ→z、肘2ボーンIK） ----
@@ -1121,13 +1222,43 @@
     }
     if (!st.init) { if (proposed != null) st.sign = proposed; st.init = true; return st.sign; }
     // フリップは腕が体側平面を通過する瞬間(zMagが小さい)だけ許可。それ以外は中間帯と同じく前回符号を保持。
-    if (proposed != null && proposed !== st.sign && zMag < HZ.FLIP_ZMAG_THRESH) st.sign = proposed;
+    if (proposed != null && proposed !== st.sign && zMag < HZ.FLIP_ZMAG_THRESH) {
+      st.sign = proposed;
+      gateDebugCounters.signFlips[idx] = (gateDebugCounters.signFlips[idx] || 0) + 1; // 評価用カウンタ(判定ロジックには不関与)
+    }
     return st.sign;
   }
 
+  // visibilityゲートのヒステリシス状態(f1タスク)。key -> 現在「凍結中」かどうか(boolean)。
+  // key はgatedFuseWrite用にidx(数値。オブジェクトキーとしては文字列化される)、gatedFuseAxis用に
+  // "13x"のような idx+軸文字の文字列を使う(既存のlastFusedZ/lastFusedAxisの命名を踏襲)ため、
+  // z用とx/y用の状態は同じidxでもキーが異なり独立して管理される(同一フレーム内は同じvisを渡すため
+  // 実質的には常に同じ結果になる＝挙動としては1つの状態として振る舞う)。
+  // Schmittトリガー：非凍結中はvis<VIS_GATE_MINで凍結開始、凍結中はvis>VIS_GATE_EXITまで凍結維持。
+  // visが欠損(null)の場合は常に非凍結（visOk()と同じ「情報なしなら許可」方針）。
+  const visGateState = {};
+  // 評価用カウンタ(f1タスクの検証専用。判定ロジックには一切使わず、__gateProbe()で読み取るだけ)。
+  // gateFlips: 凍結⇄解除が切り替わった回数(点滅の定量化)。signFlips: resolveSignで符号が実際に
+  // 反転した回数(idx=13/14/15/16別)。__resetCalibration()でゼロ初期化する。
+  const gateDebugCounters = { gateFlips: {}, signFlips: {} };
+  function visGated(key, vis) {
+    if (vis == null) {
+      if (visGateState[key]) gateDebugCounters.gateFlips[key] = (gateDebugCounters.gateFlips[key] || 0) + 1;
+      visGateState[key] = false;
+      return false;
+    }
+    const wasGated = !!visGateState[key];
+    const gated = wasGated ? !(vis > HZ.VIS_GATE_EXIT) : (vis < HZ.VIS_GATE_MIN);
+    if (gated !== wasGated) gateDebugCounters.gateFlips[key] = (gateDebugCounters.gateFlips[key] || 0) + 1;
+    visGateState[key] = gated;
+    return gated;
+  }
+  // ヘッドレス検証用（読み取り専用・f1タスク）: visibilityゲートの凍結⇄解除の累積回数と、
+  // resolveSignの符号反転の累積回数を返す。判定ロジックには一切関与しない計測専用フック。
+  window.__gateProbe = () => JSON.parse(JSON.stringify(gateDebugCounters));
   function gatedFuseWrite(world, idx, candidateZ, now) {
     const vis = world[idx] ? world[idx].visibility : null;
-    const gated = !visGateDisabled && vis != null && vis < HZ.VIS_GATE_MIN;
+    const gated = visGated(idx, vis) && !visGateDisabled;
     if (gated && lastFusedZ[idx] != null) { world[idx].z = lastFusedZ[idx]; return; }
     const filtered = oneEuro(idx, candidateZ, now);
     lastFusedZ[idx] = filtered;
@@ -1138,8 +1269,8 @@
   const lastFusedAxis = {}; // key "<idx><axis>" -> 直近の出力値（visibilityゲート保持・One Euro適用後）
   function gatedFuseAxis(world, idx, axis, candidateValue, now) {
     const vis = world[idx] ? world[idx].visibility : null;
-    const gated = !visGateDisabled && vis != null && vis < HZ.VIS_GATE_MIN;
     const key = String(idx) + axis;
+    const gated = visGated(key, vis) && !visGateDisabled;
     if (gated && lastFusedAxis[key] != null) { world[idx][axis] = lastFusedAxis[key]; return; }
     const filtered = oneEuro(key, candidateValue, now);
     lastFusedAxis[key] = filtered;
@@ -1242,6 +1373,23 @@
       },
     };
   };
+  // ヘッドレス検証用（読み取り専用・診断d2）: 肩/肘/手首×左右のvisibilityと、fuseArmZが上書きする直前の
+  // 生world zを返すだけ。既存の判定ロジック・分岐には一切関与しない。フレーム未処理ならnull群を返す。
+  window.__visProbe = () => {
+    const w = lastFusedWorld, raw = lastRawWorldZ;
+    const side = (sIdx, eIdx, wIdx) => ({
+      shoulderVis: w && w[sIdx] ? w[sIdx].visibility : null,
+      elbowVis: w && w[eIdx] ? w[eIdx].visibility : null,
+      wristVis: w && w[wIdx] ? w[wIdx].visibility : null,
+      shoulderRawZ: raw ? raw[sIdx] : null,
+      elbowRawZ: raw ? raw[eIdx] : null,
+      wristRawZ: raw ? raw[wIdx] : null,
+      // matchHandsToWrists()の直近結果(手アンカーの較正状態に一切依存しない生の検出/マッチ成否)。
+      // 較正済み(D0あり)でもここがfalseなら computeHandAnchorSide は quality=false のまま構造的に動けない。
+      handMatched: !!lastHandMatch[wIdx],
+    });
+    return { left: side(11, 13, 15), right: side(12, 14, 16) };
+  };
 
   // 上腕の前後(矢状面)角を world座標から計算。0=横(T), +=前(カメラ方向), −=後ろ
   function armSagittal(w, sIdx, eIdx, leftSide) {
@@ -1294,11 +1442,16 @@
     manualCalD09[15].length = 0; manualCalD09[16].length = 0;
     manualCalD517[15].length = 0; manualCalD517[16].length = 0;
     manualCalWm.length = 0; manualCalWn.length = 0;
+    manualCalBuf.ua2d = 0; manualCalBuf.fa2d = 0; // 手動較正の画面平行性ゲート用ランニング最大値
+    calRefUa = null; calRefFa = null; // 自動較正ドリフトクランプの基準値スナップショットを再取得させる
+    lastCalResult = null; renderCalStatus(null); // 較正結果フィードバック表示を消す
     if (calBtn) { calBtn.textContent = "📐 キャリブレーション（Tポーズ3秒）"; calBtn.disabled = false; }
     // ハイブリッドZ：フィルタ・符号・基準点の実行時状態
     clearObj(shoulderZRef); clearObj(rawZLP); clearObj(lastFusedZ); clearObj(refEma);
     clearObj(oneEuroFilters); // 内部履歴のみ初期化。ONE_EURO_MINCUTOFF/BETA設定値自体は__setOneEuroの管轄なので不変
     clearObj(lastFusedAxis);
+    clearObj(visGateState); // visibilityゲートのヒステリシス状態（凍結中フラグ）
+    clearObj(gateDebugCounters.gateFlips); clearObj(gateDebugCounters.signFlips); // 評価用カウンタ
     clearObj(depthEma); // legacy z方式のEMA状態（ハイブリッド既定では未使用だが念のため）
     for (const idx of [13, 14, 15, 16]) { signState[idx].sign = 1; signState[idx].init = false; }
     scaleFit = { a: 1, b: 0, initialized: false };
@@ -1357,6 +1510,13 @@
       const src3d = (pose3dRaw && pose3dRaw.length >= 33) ? pose3dRaw : pose2d;
       const hasWorld = !!(pose3dRaw && pose3dRaw.length >= 33);
       if (manualCalActive && hasWorld) stepManualCalibration(pose3dRaw, pose2d, lHand, rHand, vid, performance.now());
+      // __visProbe用: fuseArmZがsrc3dのz(11-16)をin-placeで上書きする直前の生値を退避（読み取り専用、既存挙動に影響なし）
+      if (hasWorld) {
+        lastRawWorldZ = {};
+        for (const i of [11, 12, 13, 14, 15, 16]) lastRawWorldZ[i] = src3d[i] ? src3d[i].z : null;
+      } else {
+        lastRawWorldZ = null;
+      }
       // z注入はfuseArmZに一元化（従来=深度直接方式 / ハイブリッド=骨長幾何+符号+One Euro+手アンカー）
       if (hasWorld) fuseArmZ(src3d, pose2d, performance.now(), lHand, rHand);
       lastFusedWorld = hasWorld ? src3d : null;
