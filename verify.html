@@ -144,6 +144,7 @@
   .badge.pass { background: rgba(52,211,153,.15); color: var(--green); border: 1px solid rgba(52,211,153,.4); }
   .badge.warn { background: rgba(253,224,71,.15); color: var(--yellow); border: 1px solid rgba(253,224,71,.4); }
   .badge.fail { background: rgba(248,113,113,.15); color: var(--danger); border: 1px solid rgba(248,113,113,.4); }
+  .badge.pending { background: rgba(138,151,168,.12); color: var(--muted); border: 1px solid rgba(138,151,168,.35); }
 
   .statgrid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
   @media (max-width: 900px) { .statgrid { grid-template-columns: repeat(2, 1fr); } }
@@ -159,6 +160,14 @@
   .thresholds table { width: 100%; border-collapse: collapse; margin-top: 6px; }
   .thresholds th, .thresholds td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
   .thresholds th { color: var(--text); font-weight: 600; }
+
+  /* ---- Occlusion note (arm visibility drop) ---- */
+  .occlusion-note {
+    margin-top: 2px; padding: 10px 14px; border-radius: 10px; font-size: 13px; line-height: 1.6;
+    background: rgba(248,113,113,.1); border: 1px solid rgba(248,113,113,.35); color: #fecaca;
+  }
+  .occlusion-note[hidden] { display: none; }
+  .occlusion-note b { color: #fff; }
 </style>
 
 <div class="wrap">
@@ -268,10 +277,19 @@
           <div class="k">ジッター RMS（フレーム間・正規化座標）</div>
         </div>
         <div class="stat">
+          <div class="v" id="statArmVisL">–</div>
+          <div class="k">左腕 visibility（直近1秒・肩肘手首平均）</div>
+        </div>
+        <div class="stat">
+          <div class="v" id="statArmVisR">–</div>
+          <div class="k">右腕 visibility（直近1秒・肩肘手首平均）</div>
+        </div>
+        <div class="stat">
           <div class="v" id="statAngleViol">–</div>
-          <div class="k">関節可動域逸脱（累積数）</div>
+          <div class="k">関節可動域逸脱（直近5秒窓のレート）</div>
         </div>
       </div>
+      <div class="occlusion-note" id="occlusionNote" hidden></div>
     </div>
 
     <div class="card">
@@ -282,20 +300,31 @@
         thighL(23-25) / thighR(24-26) / shinL(25-27) / shinR(26-28)。
         剛体である骨の長さは本来フレーム間で一定のはずなので、変動係数(CV=標準偏差/平均)が
         トラッキング精度の指標になる。左右対称性は対になる4組（上腕/前腕/大腿/下腿）の平均長の相対差。
-        ジッターσは「静止判定（2D速度 &lt; 0.25 /秒 相当）」中のフレームのみを対象にした位置のばらつき、
-        RMSは検出フレーム間の位置変化のRMS（静止・動作を問わない）。関節可動域逸脱は、肘/膝の3点角度が
-        10°未満（ランドマーク重なり＝オクルージョン崩壊の疑い）、または前フレームから45°/フレーム超で
-        急変した場合（トラッキング破綻の疑い）を累積カウントしたもの。
+        ジッターσは「静止判定（2D速度 &lt; 0.25 /秒 相当）」フレームが<b>1.0秒以上連続した区間（静止ウィンドウ）</b>
+        が窓内に存在するときだけ、その区間の位置ばらつきとして算出する。動作中で静止ウィンドウが1度も
+        成立しない場合は「—(静止時に計測)」と表示し、値が無いので<b>総合判定からは除外</b>する
+        （動作フレームの姿勢差をブレと誤計上して誤FAILになることを防ぐため）。バッジは「PENDING」
+        （灰色）で「計測待ち＝合否未確定」を表す。RMSは静止ウィンドウの有無に関わらず検出フレーム間の
+        位置変化として常時参考表示する。関節可動域逸脱は、肘/膝の3点角度が10°未満
+        （ランドマーク重なり＝オクルージョン崩壊の疑い）、または前フレームから45°/フレーム超で
+        急変した場合（トラッキング破綻の疑い）を検出したイベントで、<b>直近5秒窓に入るものだけ</b>を
+        レート（件数 / 窓内検出フレーム数）として表示する。過去に一度起きた逸脱が窓の外に流れれば
+        表示は自然に下がる（累積カウントのまま画面に残り続けて実態と乖離することを防ぐため）。
+        左右腕の visibility ミニ表示は肩(11/12)・肘(13/14)・手首(15/16)の直近1秒平均で、
+        0.5未満（スケルトン描画の赤しきい値と同じ）になった側があれば「遮蔽の疑い」の注記を出す
+        （突きや遠位リーチで拳・前腕がカメラや体幹に重なり visibility が落ちるケースの原因表示用。
+        今回の実機検証で発生した現象に対応）。
         <table>
           <tr><th>指標</th><th>PASS</th><th>WARN</th><th>FAIL</th></tr>
           <tr><td>検出率</td><td>≥ 0.90</td><td>0.70–0.90</td><td>&lt; 0.70</td></tr>
           <tr><td>ボーンCV(overall)</td><td>&lt; 0.15</td><td>0.15–0.30</td><td>≥ 0.30</td></tr>
           <tr><td>左右対称性誤差</td><td>&lt; 0.20</td><td>0.20–0.35</td><td>≥ 0.35</td></tr>
-          <tr><td>ジッターσ(正規化)</td><td>&lt; 0.004</td><td>0.004–0.010</td><td>≥ 0.010</td></tr>
+          <tr><td>ジッターσ(正規化・静止ウィンドウ内のみ)</td><td>&lt; 0.004</td><td>0.004–0.010</td><td>≥ 0.010（未計測時はPENDINGで総合から除外）</td></tr>
         </table>
         検出率/ボーンCV/対称性の暫定値は <code>test/tracking/checks.mjs</code>
         の不変量チェックと揃えてある。ジッターσは 1280px 基準でおよそ 5px / 13px のブレに相当する値を仮置きした
-        （実測分布が出た段階で調整する前提の初期値）。「総合」はこれら4指標のうち最も悪い判定を採用する。
+        （実測分布が出た段階で調整する前提の初期値）。「総合」はこれら4指標（ジッターがPENDINGの場合は残り3指標）
+        のうち最も悪い判定を採用する。
       </div>
     </div>
   </div>
@@ -346,7 +375,10 @@
   const statSymmetryEl = document.getElementById("statSymmetry");
   const statJitterSigmaEl = document.getElementById("statJitterSigma");
   const statJitterRmsEl = document.getElementById("statJitterRms");
+  const statArmVisLEl = document.getElementById("statArmVisL");
+  const statArmVisREl = document.getElementById("statArmVisR");
   const statAngleViolEl = document.getElementById("statAngleViol");
+  const occlusionNoteEl = document.getElementById("occlusionNote");
   const overallBadgeEl = document.getElementById("overallBadge");
   const badgeBoneCVEl = document.getElementById("badgeBoneCV");
   const badgeSymmetryEl = document.getElementById("badgeSymmetry");
@@ -384,8 +416,12 @@
   const ANGLE_JUMP_MAX_DT_MS = 500; // これより長い間隔が空いていたら急変チェックは行わない
 
   const STILL_SPEED_THRESH = 0.25; // 正規化座標/秒（depth-lab.html の値を踏襲）
+  const STILL_WINDOW_MIN_MS = 1000; // ジッターσを算出するために必要な「連続静止」の最低継続時間
   const WINDOW_MS = 5000;          // 計測窓（直近5秒）
   const HISTORY_MS = 7000;         // 内部バッファの保持長（窓+余裕）
+  const ARM_VIS_WINDOW_MS = 1000;  // 腕visibilityミニ表示の集計窓（直近1秒）
+  const ARM_LANDMARKS = { left: [11, 13, 15], right: [12, 14, 16] }; // 肩・肘・手首
+  const OCCLUSION_VIS_THRESH = 0.5; // スケルトン描画の赤しきい値と同じ（遮蔽の疑い注記トリガー）
 
   // ===== 状態 =====
   let holistic = null;
@@ -403,7 +439,8 @@
 
   // metricsHistory: 全フレーム（検出成否問わず）を保持。fps/検出率/CV/対称性/ジッター/角度逸脱の単一ソース
   let metricsHistory = [];
-  let angleViolations = 0;
+  let angleViolations = 0; // 累積カウント（後方互換のため__stats().angleViolationsとして維持。checks.mjsが消費）
+  let angleViolationEvents = []; // 各逸脱イベントのタイムスタンプ。直近5秒窓のレート表示用（表示は減衰する）
   const prevAngle = { elbowL: null, elbowR: null, kneeL: null, kneeR: null };
   const prevAngleT = { elbowL: null, elbowR: null, kneeL: null, kneeR: null };
 
@@ -460,7 +497,12 @@
   function worstVerdict(...vs) {
     const rank = { pass: 0, warn: 1, fail: 2 };
     let w = "pass";
-    for (const v of vs) if (v && rank[v] > rank[w]) w = v;
+    // "pending"（例: ジッターσが静止ウィンドウ未成立で未計測）はrankに存在しないため素通りする。
+    // 明示的にスキップして総合判定(overall)に影響させない（FAILの原因にしない）。
+    for (const v of vs) {
+      if (!v || v === "pending" || !(v in rank)) continue;
+      if (rank[v] > rank[w]) w = v;
+    }
     return w;
   }
   function verdictLte(value, passMax, warnMax) {
@@ -536,6 +578,7 @@
       // __record() が独立して管理するため、__start() 前後の呼び出し順序に関わらずここでは触らない）
       metricsHistory = [];
       angleViolations = 0;
+      angleViolationEvents = [];
       prevAngle.elbowL = prevAngle.elbowR = prevAngle.kneeL = prevAngle.kneeR = null;
       prevAngleT.elbowL = prevAngleT.elbowR = prevAngleT.kneeL = prevAngleT.kneeR = null;
       statsLog = [];
@@ -618,14 +661,17 @@
       vis = lm2.map((p) => (p && p.visibility != null ? p.visibility : 1));
 
       // 関節可動域チェック（肘・膝の3点角度）
+      // angleViolations は累積カウント（__stats()の後方互換フィールド。checks.mjsが消費）。
+      // angleViolationEvents はイベントごとのタイムスタンプで、UIの「直近5秒窓レート」表示専用
+      // （古いイベントは下のtrimで窓+余裕を過ぎたら捨てるので、表示は自然に減衰する）。
       for (const jt of JOINTS) {
         if (!visOk(vis, jt.a) || !visOk(vis, jt.j) || !visOk(vis, jt.b)) continue;
         const ang = angleAt(world, jt.a, jt.j, jt.b);
         if (ang == null) continue;
-        if (ang < ANGLE_MIN_DEG) angleViolations++;
+        if (ang < ANGLE_MIN_DEG) { angleViolations++; angleViolationEvents.push(nowMs); }
         const pa = prevAngle[jt.name], pt = prevAngleT[jt.name];
         if (pa != null && pt != null && (nowMs - pt) <= ANGLE_JUMP_MAX_DT_MS) {
-          if (Math.abs(ang - pa) > ANGLE_JUMP_MAX_DEG) angleViolations++;
+          if (Math.abs(ang - pa) > ANGLE_JUMP_MAX_DEG) { angleViolations++; angleViolationEvents.push(nowMs); }
         }
         prevAngle[jt.name] = ang;
         prevAngleT[jt.name] = nowMs;
@@ -635,6 +681,7 @@
     metricsHistory.push({ t: nowMs, detected, lm2: detected ? lm2 : null, world: detected ? world : null, vis });
     const cutoff = nowMs - HISTORY_MS;
     while (metricsHistory.length && metricsHistory[0].t < cutoff) metricsHistory.shift();
+    while (angleViolationEvents.length && angleViolationEvents[0] < cutoff) angleViolationEvents.shift();
 
     if (recording) {
       recordTotalTicks++;
@@ -657,6 +704,38 @@
     }
 
     lastResult = res;
+  }
+
+  // ===== 静止ウィンドウ検出（ジッターσの前提。2D速度<閾値のフレームが一定時間以上連続した区間を探す）=====
+  // 動作中の一瞬だけ速度が閾値を下回るフレームを拾って「静止」と誤判定し、直前直後の姿勢差を
+  // ブレとして計上して誤FAILになる問題（実機検証で確認済み）への対処。centroids配列（時系列順・
+  // 検出フレームのみ）を連続run に分割し、run内の経過時間がminDurationMs以上のものだけを候補にする。
+  // 複数candidateがあれば最長のものを採用（プールして混ぜるとstillWindowMsの意味が曖昧になるため）。
+  function findLongestStillWindow(centroids, speedThresh, minDurationMs) {
+    let best = null;
+    let segStart = 0;
+    for (let i = 1; i <= centroids.length; i++) {
+      let breakRun = i === centroids.length;
+      if (!breakRun) {
+        const dt = (centroids[i].t - centroids[i - 1].t) / 1000;
+        if (dt > 0) {
+          const spd = Math.hypot(centroids[i].x - centroids[i - 1].x, centroids[i].y - centroids[i - 1].y) / dt;
+          if (spd >= speedThresh) breakRun = true;
+        }
+        // dt<=0（タイムスタンプ重複）は従来同様「継続」扱いでrunを切らない
+      }
+      if (breakRun) {
+        const seg = centroids.slice(segStart, i);
+        if (seg.length >= 2) {
+          const durationMs = seg[seg.length - 1].t - seg[0].t;
+          if (durationMs >= minDurationMs && (!best || durationMs > best.durationMs)) {
+            best = { frames: seg, durationMs };
+          }
+        }
+        segStart = i;
+      }
+    }
+    return best;
   }
 
   // ===== 計測（1Hz UI更新 と window.__stats() の共通ロジック）=====
@@ -712,7 +791,10 @@
     if (relDiffs.length) symmetry.overall = mean(relDiffs);
 
     // ジッター（正規化2D座標）
-    const jitter = { sigma2d: null, rms2d: null };
+    // sigma2dは「連続した静止ウィンドウ（既定1.0秒以上）」が窓内に存在するときのみ算出する。
+    // 存在しない場合はnullのまま返し、UIは「—(静止時に計測)」を表示、verdictは"pending"にして
+    // 総合判定（overall）から除外する（動作中フレームの姿勢差をブレと誤計上する誤FAIL対策）。
+    const jitter = { sigma2d: null, rms2d: null, hasStillWindow: false, stillWindowMs: 0 };
     // still判定: 検出フレーム列上で、可視ランドマーク重心の2D速度が閾値未満
     const centroids = detected.map((h) => {
       const pts = [];
@@ -721,15 +803,11 @@
       return { t: h.t, x: mean(pts.map((p) => p.x)), y: mean(pts.map((p) => p.y)), lm2: h.lm2, vis: h.vis };
     }).filter(Boolean);
 
-    const stillFrames = [];
-    for (let i = 0; i < centroids.length; i++) {
-      if (i === 0) { stillFrames.push(centroids[i]); continue; }
-      const dt = (centroids[i].t - centroids[i - 1].t) / 1000;
-      if (dt <= 0) { stillFrames.push(centroids[i]); continue; }
-      const spd = Math.hypot(centroids[i].x - centroids[i - 1].x, centroids[i].y - centroids[i - 1].y) / dt;
-      if (spd < STILL_SPEED_THRESH) stillFrames.push(centroids[i]);
-    }
-    if (stillFrames.length >= 3) {
+    const stillWindow = findLongestStillWindow(centroids, STILL_SPEED_THRESH, STILL_WINDOW_MIN_MS);
+    const stillFrames = stillWindow ? stillWindow.frames : [];
+    jitter.stillWindowMs = stillWindow ? stillWindow.durationMs : 0;
+    jitter.hasStillWindow = stillFrames.length >= 3; // 継続時間に加えてサンプル数の最低保証（従来踏襲）
+    if (jitter.hasStillWindow) {
       // ランドマークごとの平均位置からの距離二乗を平均→sqrt
       const n = 33;
       const sums = new Array(n).fill(0).map(() => ({ x: 0, y: 0, c: 0 }));
@@ -764,21 +842,47 @@
       if (sqc > 0) jitter.rms2d = Math.sqrt(sq / sqc);
     }
 
+    // 腕visibility（直近1秒・肩/肘/手首平均）。突きや遠位リーチで拳・前腕がカメラや体幹に重なり
+    // visibilityが落ちる「遮蔽」を数値とHUD注記で見えるようにする（実機検証で発生した現象への対処）。
+    const armVisWindowStart = Math.max(now - ARM_VIS_WINDOW_MS, trackingStartedAt || 0);
+    const armWin = metricsHistory.filter((h) => h.detected && h.t >= armVisWindowStart && h.t <= now);
+    function avgArmVis(indices) {
+      const vals = [];
+      for (const h of armWin) for (const idx of indices) if (h.vis && h.vis[idx] != null) vals.push(h.vis[idx]);
+      return vals.length ? mean(vals) : null;
+    }
+    const armVis = { left: avgArmVis(ARM_LANDMARKS.left), right: avgArmVis(ARM_LANDMARKS.right) };
+
+    // 関節可動域逸脱：直近5秒窓に入るイベントだけを数えたレート表示（累積角度逸脱カウント
+    // angleViolationsとは別枠）。過去に一度起きた逸脱スパイクが画面に永久に残らないようにする。
+    const angleViolWindowCount = angleViolationEvents.filter((t) => t >= windowStart && t <= now).length;
+    const angleViolationsWindow = {
+      count: angleViolWindowCount,
+      rate: detectedCount > 0 ? angleViolWindowCount / detectedCount : null,
+      windowMs: Math.round(now - windowStart),
+      detectedCount,
+    };
+
     const verdicts = {
       boneCV: verdictLte(boneCV.overall, TH.boneCV.passMax, TH.boneCV.warnMax),
       symmetry: verdictLte(symmetry.overall, TH.symmetry.passMax, TH.symmetry.warnMax),
-      jitter: verdictLte(jitter.sigma2d, TH.jitterSigma.passMax, TH.jitterSigma.warnMax),
+      // 静止ウィンドウが窓内に無ければ算出不能＝"pending"（合否未確定。総合判定からは除外する）
+      jitter: jitter.hasStillWindow ? verdictLte(jitter.sigma2d, TH.jitterSigma.passMax, TH.jitterSigma.warnMax) : "pending",
       overall: "pass",
     };
     const detectVerdict = verdictGte(detectRate, TH.detectRate.passMin, TH.detectRate.warnMin);
     verdicts.overall = worstVerdict(verdicts.boneCV, verdicts.symmetry, verdicts.jitter, detectVerdict);
 
-    return { fps, detectRate, boneCV, symmetry, jitter, angleViolations, verdicts };
+    return { fps, detectRate, boneCV, symmetry, jitter, angleViolations, angleViolationsWindow, armVis, verdicts };
   }
 
   // ===== 計測パネル描画 =====
-  function badgeText(v) { return v === "pass" ? "PASS" : v === "warn" ? "WARN" : v === "fail" ? "FAIL" : "–"; }
+  function badgeText(v) { return v === "pass" ? "PASS" : v === "warn" ? "WARN" : v === "fail" ? "FAIL" : v === "pending" ? "PENDING" : "–"; }
   function setBadge(el, v) { el.textContent = badgeText(v); el.className = "badge " + (v || ""); }
+
+  // 腕visibility値の色分け（スケルトン描画のvisibility色分け=poseColorと同じ閾値・配色に揃える）
+  function armVisColor(v) { return poseColor(v); }
+  function fmtArmVis(v) { return v == null || !isFinite(v) ? "–" : v.toFixed(2); }
 
   function renderStatsPanel(m) {
     statFpsEl.textContent = fmtNum(m.fps, 1);
@@ -786,9 +890,32 @@
     statBoneCVEl.textContent = fmtNum(m.boneCV.overall, 4);
     statBoneWorstEl.textContent = m.boneCV.worst.bone ? (m.boneCV.worst.bone + " (" + fmtNum(m.boneCV.worst.cv, 4) + ")") : "–";
     statSymmetryEl.textContent = fmtPct(m.symmetry.overall);
-    statJitterSigmaEl.textContent = fmtNum(m.jitter.sigma2d, 5);
+    // ジッターσ: 静止ウィンドウ（連続1.0秒以上）が窓内に無ければ算出不能。値の代わりに理由を表示する
+    statJitterSigmaEl.textContent = m.jitter.hasStillWindow ? fmtNum(m.jitter.sigma2d, 5) : "—(静止時に計測)";
     statJitterRmsEl.textContent = fmtNum(m.jitter.rms2d, 5);
-    statAngleViolEl.textContent = String(m.angleViolations);
+
+    // 左右腕visibility（直近1秒・肩肘手首平均）。低下時は遮蔽の疑いを色+テキストで示す
+    statArmVisLEl.textContent = fmtArmVis(m.armVis.left);
+    statArmVisLEl.style.color = armVisColor(m.armVis.left);
+    statArmVisREl.textContent = fmtArmVis(m.armVis.right);
+    statArmVisREl.style.color = armVisColor(m.armVis.right);
+    const occludedSides = [];
+    if (m.armVis.left != null && m.armVis.left < OCCLUSION_VIS_THRESH) occludedSides.push("左腕");
+    if (m.armVis.right != null && m.armVis.right < OCCLUSION_VIS_THRESH) occludedSides.push("右腕");
+    if (occludedSides.length) {
+      occlusionNoteEl.hidden = false;
+      occlusionNoteEl.innerHTML = "⚠ <b>遮蔽の疑い</b>（" + occludedSides.join("・") + "がカメラや体で隠れています）: " +
+        "visibilityが低下すると骨格が乱れやすくなります。カメラに対して腕を横に開く、体をやや斜めにする等で改善する場合があります。";
+    } else {
+      occlusionNoteEl.hidden = true;
+      occlusionNoteEl.textContent = "";
+    }
+
+    // 関節可動域逸脱: 直近5秒窓のレート表示（累積のまま残り続けないよう、窓外の逸脱は自然に減衰する）
+    const avw = m.angleViolationsWindow;
+    statAngleViolEl.textContent = avw && avw.detectedCount > 0
+      ? fmtPct(avw.rate) + "（" + avw.count + "件/" + avw.detectedCount + "検出）"
+      : (avw ? String(avw.count) + "件" : "–");
 
     setBadge(badgeBoneCVEl, m.verdicts.boneCV);
     setBadge(badgeSymmetryEl, m.verdicts.symmetry);
@@ -809,8 +936,10 @@
         fps: m.fps, detectRate: m.detectRate,
         boneCVOverall: m.boneCV.overall, boneCVWorstBone: m.boneCV.worst.bone, boneCVWorstVal: m.boneCV.worst.cv,
         symmetryOverall: m.symmetry.overall,
-        jitterSigma2d: m.jitter.sigma2d, jitterRms2d: m.jitter.rms2d,
+        jitterSigma2d: m.jitter.sigma2d, jitterRms2d: m.jitter.rms2d, jitterHasStillWindow: m.jitter.hasStillWindow,
+        armVisL: m.armVis.left, armVisR: m.armVis.right,
         angleViolations: m.angleViolations,
+        angleViolWindowCount: m.angleViolationsWindow.count, angleViolWindowRate: m.angleViolationsWindow.rate,
         verdictBoneCV: m.verdicts.boneCV, verdictSymmetry: m.verdicts.symmetry, verdictJitter: m.verdicts.jitter, verdictOverall: m.verdicts.overall,
       });
     }
@@ -945,7 +1074,7 @@
   // ===== CSV / スナップショット =====
   function exportStatsCsv() {
     if (statsLog.length === 0) return;
-    const cols = ["t", "fps", "detectRate", "boneCVOverall", "boneCVWorstBone", "boneCVWorstVal", "symmetryOverall", "jitterSigma2d", "jitterRms2d", "angleViolations", "verdictBoneCV", "verdictSymmetry", "verdictJitter", "verdictOverall"];
+    const cols = ["t", "fps", "detectRate", "boneCVOverall", "boneCVWorstBone", "boneCVWorstVal", "symmetryOverall", "jitterSigma2d", "jitterRms2d", "jitterHasStillWindow", "armVisL", "armVisR", "angleViolations", "angleViolWindowCount", "angleViolWindowRate", "verdictBoneCV", "verdictSymmetry", "verdictJitter", "verdictOverall"];
     let csv = cols.join(",") + "\n";
     for (const r of statsLog) {
       csv += cols.map((c) => {
