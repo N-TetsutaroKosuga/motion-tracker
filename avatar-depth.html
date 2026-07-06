@@ -211,6 +211,8 @@
         <button class="btn-ghost" data-sim="up">バンザイ</button>
         <button class="btn-ghost" data-sim="tpose">Tポーズ</button>
         <button class="btn-ghost" data-sim="leftup">左手だけ上げ</button>
+        <button class="btn-ghost" data-sim="punch">正拳突き</button>
+        <button class="btn-ghost" data-sim="punchcycle">正拳突き（連続）</button>
         <button class="btn-ghost" data-sim="">解除</button>
       </div>
     </div>
@@ -288,6 +290,11 @@
   let tracking = false;
   let starting = false;
   let simResult = null; // シミュレーション中はこの合成結果を使う（カメラ不要）
+  // 動的シミュレーション用(正拳突きサイクル等): nullでなければ毎フレームloop()内で
+  // simResult = simAnimator(now) として再生成される(cloneSimFrameの意味論・実カメラ経路は不変)。
+  // 解除系(setSim経由の全ボタン)・__simPunchStop()のいずれでもnullに戻る。__resetCalibration()とは
+  // 意図的に独立(較正リセットとアニメ再生は無関係な関心事のため、片方の呼び出しで他方を止めない)。
+  let simAnimator = null;
   let SMOOTH = 0.3;
   let WRIST_MODE = "auto"; // "natural"=常に前腕追従 / "track"=常にKalidokitの手首向きを適用 / "auto"=手が大きく映っている時だけ適用（ハイブリッド既定）
   window.__setWristMode = (m) => { WRIST_MODE = m; };
@@ -1781,7 +1788,12 @@
     return { poseLandmarks: [lm2], poseWorldLandmarks: [world], leftHandLandmarks: [], rightHandLandmarks: [], faceLandmarks: [] };
   }
   function setSim(name) {
-    simResult = name ? buildPose(name) : null;
+    simAnimator = null; // 新しいポーズを選ぶ・解除するいずれの場合も進行中のアニメーションは停止する
+    if (name === "punchcycle") {
+      window.__simPunchCycle();
+    } else {
+      simResult = name ? (name === "punch" ? buildPosePunch("left", 85) : buildPose(name)) : null;
+    }
     [...document.querySelectorAll("[data-sim]")].forEach((b) => b.classList.toggle("active", b.dataset.sim === name));
   }
   window.__simPose = setSim;                       // ヘッドレス自己検証フック
@@ -1799,7 +1811,15 @@
     const lm2 = world.map((p) => ({ x: Math.min(1, Math.max(0, 0.5 + p.x * 0.6)), y: Math.min(1, Math.max(0, 0.55 + p.y * 0.45)), z: p.z, visibility: 1 }));
     return { poseLandmarks: [lm2], poseWorldLandmarks: [world], leftHandLandmarks: [], rightHandLandmarks: [], faceLandmarks: [] };
   }
-  window.__simElev = (deg) => { simResult = buildPoseElev(deg); };
+  // レビューg-adv1で発見・修正: 以下のヘッドレス検証フック群(__simElev/__simReach/__simReachLR/
+  // __simReach3D/__simCross/__simHand/__simReachHand/__simReachHand2/__simVis)は、simResultへの
+  // 直接代入だけを行い simAnimator を止めていなかった。__simPunchCycle()実行中にこれらを呼ぶと、
+  // loop()側の `if (simAnimator) simResult = simAnimator(now)` が次のrAFで即座に上書きしてしまい、
+  // 指定したポーズが(見た目にも__zProbe等の数値にも)一切反映されないまま正拳突きサイクルが続いてしまう
+  // (実測で再現確認済み)。setSim()経由のUIボタンは既に simAnimator=null をしているため実UI操作では
+  // 起きないが、ヘッドレス自己検証やdevtoolsからの直接呼び出しでは容易に踏む罠のため、他の__sim*同様に
+  // 呼び出し時点でsimAnimatorを止める。
+  window.__simElev = (deg) => { simAnimator = null; simResult = buildPoseElev(deg); };
   // 前後リーチ: T(横)→reachDegで前方(カメラ方向 -Z)へ腕を振る合成ポーズ
   function buildPoseReach(reachDeg) {
     const r = (reachDeg * Math.PI) / 180, c = Math.cos(r), s = Math.sin(r), U = 0.27, F = 0.25;
@@ -1813,7 +1833,7 @@
     const lm2 = world.map((p) => ({ x: Math.min(1, Math.max(0, 0.5 + p.x * 0.6)), y: Math.min(1, Math.max(0, 0.55 + p.y * 0.45)), z: p.z, visibility: 1 }));
     return { poseLandmarks: [lm2], poseWorldLandmarks: [world], leftHandLandmarks: [], rightHandLandmarks: [], faceLandmarks: [] };
   }
-  window.__simReach = (deg) => { simResult = buildPoseReach(deg); };
+  window.__simReach = (deg) => { simAnimator = null; simResult = buildPoseReach(deg); };
   // ---- s2-hooks 追加ビルダー: 左右非対称・方位角+仰角の複合・交差リーチ(testSurface.md §4-1,4-5の穴埋め) ----
   // 共通ヘルパー：既存4ビルダーと同じ胴体/脚の固定座標（肩11/12・腰23/24・膝25/26・足首27/28・鼻0）
   function simBaseTorsoLegs() {
@@ -1846,7 +1866,7 @@
     }
     return simFinalize(W);
   }
-  window.__simReachLR = (degL, degR) => { simResult = buildPoseReachLR(degL, degR); };
+  window.__simReachLR = (degL, degR) => { simAnimator = null; simResult = buildPoseReachLR(degL, degR); };
   // 方位角(azimDeg: 0=真横→90=真正面。buildPoseReachと同じ規約)+仰角(elevDeg: -90..90。buildPoseElevと
   // 同じ規約)の複合リーチ。肘は伸ばした一直線＝単位方向ベクトルdirにU/Fを掛けるだけなのでdx²+dy²+dz²=U²/F²
   // を厳密に保つ。azim=0またはelev=0はそれぞれbuildPoseElev/buildPoseReachの計算と一致する特別な場合になる
@@ -1872,7 +1892,7 @@
     } else { W[14] = [-0.20, -0.22, 0]; W[16] = [-0.22, 0.02, 0]; }
     return simFinalize(W);
   }
-  window.__simReach3D = (azimDeg, elevDeg, side) => { simResult = buildPoseReach3D(azimDeg, elevDeg, side); };
+  window.__simReach3D = (azimDeg, elevDeg, side) => { simAnimator = null; simResult = buildPoseReach3D(azimDeg, elevDeg, side); };
   // 左腕が体の正中線を越えて右前方へ交差するリーチ。真正面(buildPoseReachのreachDeg=90相当)から
   // さらに同じ回転方向へdeg分振り切ることで交差を表現する(theta=90+deg、deg=交差の深さ0..60目安)。
   // theta>90になるとcos(theta)<0＝肘/手首のxが対側(負)に転じ、sin(theta)>0が保たれる限りzは負(前)のまま。
@@ -1885,7 +1905,7 @@
     W[14] = [-0.20, -0.22, 0]; W[16] = [-0.22, 0.02, 0];
     return simFinalize(W);
   }
-  window.__simCross = (deg) => { simResult = buildPoseCross(deg); };
+  window.__simCross = (deg) => { simAnimator = null; simResult = buildPoseCross(deg); };
   window.__view = (deg) => {
     const r = (deg * Math.PI) / 180;
     camera.position.set(3 * Math.sin(r), 0.85, 3 * Math.cos(r));
@@ -1925,11 +1945,12 @@
     base.leftHandLandmarks = [makeHand({ x: lw.x, y: lw.y, z: 0 }, D.f, D.s, 0.12)];
     return base;
   }
-  window.__simHand = (dir) => { simResult = buildHandTest(dir); };
+  window.__simHand = (dir) => { simAnimator = null; simResult = buildHandTest(dir); };
   // 手アンカー検証用: 前方リーチ(reachDeg)にfwd向きの左手(スケール0.12*handScale)を付与した合成結果を
   // 作り、simResultにセットして返す。マッチングはポーズ手首との2D最近傍で行われるためlabelはどちらでも
   // 動作するが、rigHand互換のためleftHandLandmarksに格納する。
   window.__simReachHand = (reachDeg, handScale) => {
+    simAnimator = null;
     const base = buildPoseReach(reachDeg);
     const lw = base.poseLandmarks[0][15];
     const f = { x: 0, y: 0, z: -1 }, s = { x: -1, y: 0, z: 0 }; // buildHandTestの"fwd"プリセットと同一の向き
@@ -1942,6 +1963,7 @@
   // ミラーで生成する（左右の手が体の中心線に対して鏡像になるように）。reachDeg=nullならその側は
   // "down"姿勢のままハンドランドマークだけ手首位置に追加する。
   window.__simReachHand2 = (reachDegL, handScaleL, reachDegR, handScaleR) => {
+    simAnimator = null;
     const base = buildPoseReachLR(reachDegL, reachDegR);
     const lw = base.poseLandmarks[0][15], rw = base.poseLandmarks[0][16];
     const f = { x: 0, y: 0, z: -1 };
@@ -1962,6 +1984,7 @@
     return null;
   }
   window.__simVis = (baseName, visMap) => {
+    simAnimator = null;
     const base = simVisBase(baseName);
     if (!base) { console.warn("__simVis: unknown baseName", baseName); return null; }
     const applyVis = (arr) => arr[0].map((p, i) => ({ x: p.x, y: p.y, z: p.z, visibility: (visMap && visMap[i] != null) ? visMap[i] : p.visibility }));
@@ -1969,6 +1992,142 @@
     simResult = out;
     return out;
   };
+
+  // ---- 正拳突き(punch)ポーズ: 静止版 buildPosePunch + 動的サイクル buildPosePunchFrame ----
+  // 突き腕: buildPoseReach系と全く同じ数学(肩から矢状面内でextendDeg、-Z方向へ伸展)。
+  // 引き手(チャンバー): セグメント長U/F厳守の閉形式(数式導出はtest/sim/expectations.mdに記録)。
+  //   上腕 = 肩 + U*(0, cos(CHAMBER_UA_DEG), sin(CHAMBER_UA_DEG))   … 体側で下向き+やや後方(+Z)
+  //   前腕 = 肘 + F*(0, cos(CHAMBER_FA_DEG), -sin(CHAMBER_FA_DEG))  … 前下方、拳が腰脇の高さに来る
+  // いずれもdx²+dy²+dz²=U²/F²を厳密に満たす(方向が単位ベクトルのため)。xは肩のxのまま(矢状面(y-z)内のみ)。
+  const CHAMBER_UA_DEG = 20, CHAMBER_FA_DEG = 50;
+  function chamberUaDir() { const r = (CHAMBER_UA_DEG * Math.PI) / 180; return { x: 0, y: Math.cos(r), z: Math.sin(r) }; }
+  function chamberFaDir() { const r = (CHAMBER_FA_DEG * Math.PI) / 180; return { x: 0, y: Math.cos(r), z: -Math.sin(r) }; }
+  // 突き腕の方向(単位ベクトル)。buildPoseReachと同じ規約(拳の高さ=肩の高さ、-Z方向へ伸展)。
+  function punchDir(leftSide, extendRad) {
+    return { x: (leftSide ? 1 : -1) * Math.cos(extendRad), y: 0, z: -Math.sin(extendRad) };
+  }
+  // 単位方向ベクトルdirUa/dirFa(共にxyz)を使って肩shIdxから肘elIdx・手首wrIdxのworld座標をWに書き込む。
+  function applyArmDir(W, shIdx, elIdx, wrIdx, dirUa, dirFa) {
+    const U = 0.27, F = 0.25;
+    const sh = W[shIdx];
+    const eo = { x: sh[0] + U * dirUa.x, y: sh[1] + U * dirUa.y, z: U * dirUa.z };
+    W[elIdx] = [eo.x, eo.y, eo.z];
+    W[wrIdx] = [eo.x + F * dirFa.x, eo.y + F * dirFa.y, eo.z + F * dirFa.z];
+    forceArmSign(elIdx, dirUa.z);
+    forceArmSign(wrIdx, dirFa.z);
+  }
+  // レビューg-adv1で発見・修正: resolveSign(fuseArmZHybrid内)は「zMagが小さい(=肩/肘との2D投影長が
+  // ほぼ全長=体側平面通過付近)時だけ符号反転を許可」というヒステリシスを持つ。これは実カメラの
+  // 自然な腕の往復(前後反転時は一旦横に開く)を前提にした設計だが、正拳突きの引き手⇔突きの往復は
+  // x成分をほぼ0に保ったまま(矢状面(y-z平面)内だけで)往復するため、2D投影長がU/Fの全長付近まで
+  // 伸びる瞬間が実質発生せず、反転の機会が正しいタイミングで来ない(実測: 符号が固着し、引き手なのに
+  // 前方判定・突きなのに後方判定のまま止まる区間が発生する。詳細はレビュー報告参照)。
+  // 対策: このポーズは合成時点でz成分の符号(前/後)が数学的に既知なので、resolveSignの推定に頼らず
+  // signState(肘/手首×左右の符号ヒステリシス状態)を毎フレーム直接、真の符号で上書きする。
+  // resolveSign自体のアルゴリズム・実カメラ経路には一切触れない(このポーズ生成関数からしか呼ばれない)。
+  function forceArmSign(idx, dz) {
+    if (!(Math.abs(dz) > 1e-6)) return; // 符号があいまいな遷移の一瞬はresolveSignの通常挙動に委ねる
+    const st = signState[idx];
+    if (!st) return;
+    st.sign = dz < 0 ? 1 : -1; // MediaPipe規約: -z=カメラ手前(前)。前方向きならsign=+1(resolveSignと同じ規約)
+    st.init = true;
+  }
+  // 単位ベクトルa→bの球面線形補間(t=0でa、t=1でb)。|a|=|b|=1のとき常に|結果|=1を保つため、
+  // applyArmDirに渡す前にU/Fを掛ければアニメーション中も常にセグメント長厳守が成り立つ。
+  function slerpUnit3(a, b, t) {
+    const dot = Math.min(1, Math.max(-1, a.x * b.x + a.y * b.y + a.z * b.z));
+    const theta0 = Math.acos(dot);
+    if (theta0 < 1e-6) return { x: b.x, y: b.y, z: b.z };
+    const theta = theta0 * t;
+    const s0 = Math.sin(theta0 - theta) / Math.sin(theta0);
+    const s1 = Math.sin(theta) / Math.sin(theta0);
+    return { x: a.x * s0 + b.x * s1, y: a.y * s0 + b.y * s1, z: a.z * s0 + b.z * s1 };
+  }
+  // 静止版: side側は突き腕(伸展extendDeg、既定85°)、反対側は引き手(チャンバー、常時固定)。
+  // 突き腕の手首にはmakeHandでfwd向きの手ランドマークを付与(scale=0.12*handScale、既定1.4=
+  // 較正基準の1.4倍で「近い」を表現)。引き手側は手なし(実測でも検出されない、CONTRACT.md参照)。
+  function buildPosePunch(side, extendDeg, handScale) {
+    const deg = extendDeg == null ? 85 : extendDeg;
+    const hs = handScale == null ? 1.4 : handScale;
+    const r = (deg * Math.PI) / 180;
+    const punchLeft = side !== "right"; // "left"(既定含む)なら左が突き腕、"right"なら右が突き腕
+    const W = simBaseTorsoLegs();
+    const pDir = punchDir(punchLeft, r);
+    const cUa = chamberUaDir(), cFa = chamberFaDir();
+    if (punchLeft) { applyArmDir(W, 11, 13, 15, pDir, pDir); applyArmDir(W, 12, 14, 16, cUa, cFa); }
+    else { applyArmDir(W, 12, 14, 16, pDir, pDir); applyArmDir(W, 11, 13, 15, cUa, cFa); }
+    const out = simFinalize(W);
+    const wIdx = punchLeft ? 15 : 16;
+    const w = out.poseLandmarks[0][wIdx];
+    const f = { x: 0, y: 0, z: -1 }, s = punchLeft ? { x: -1, y: 0, z: 0 } : { x: 1, y: 0, z: 0 };
+    const hand = [makeHand({ x: w.x, y: w.y, z: 0 }, f, s, 0.12 * hs)];
+    out.leftHandLandmarks = punchLeft ? hand : [];
+    out.rightHandLandmarks = punchLeft ? [] : hand;
+    return out;
+  }
+  window.__simPunch = (side, extendDeg, handScale) => {
+    simAnimator = null;
+    simResult = buildPosePunch(side, extendDeg, handScale);
+    return simResult;
+  };
+  // 動的サイクル1フレーム分の合成: elapsedMs(サイクル開始からの経過ms)とopts{periodMs,alternate,visDip}
+  // から、その瞬間のポーズを計算する純関数(simAnimatorから毎フレーム呼ばれる)。
+  // 構え(両腕チャンバー)は特別扱いではなく、frac=0(各ビート開始/終了の瞬間)で自然に両腕チャンバーになる
+  // (アクティブ側もslerp(chamber,punch,0)=chamberに一致するため)。
+  function buildPosePunchFrame(elapsedMs, opts) {
+    const period = opts.periodMs;
+    const e = Math.max(0, elapsedMs);
+    const beatIndex = Math.floor(e / period);
+    const t = e - beatIndex * period;
+    const activeLeft = opts.alternate ? beatIndex % 2 === 0 : true;
+    const frac = (1 - Math.cos((2 * Math.PI * t) / period)) / 2; // 半コサイン: 0→1(伸展)→0(引き戻し)
+    const vis = opts.visDip ? clamp(1 - 0.7 * frac, 0.3, 1) : 1; // 1.0→0.3→1.0、extend位相に連動
+    const EXTEND_RAD = (85 * Math.PI) / 180;
+    const cUa = chamberUaDir(), cFa = chamberFaDir();
+    const W = simBaseTorsoLegs();
+    const visOverride = {};
+    const doSide = (shIdx, elIdx, wrIdx, leftSide, isActive) => {
+      if (isActive) {
+        const pDir = punchDir(leftSide, EXTEND_RAD);
+        applyArmDir(W, shIdx, elIdx, wrIdx, slerpUnit3(cUa, pDir, frac), slerpUnit3(cFa, pDir, frac));
+        if (opts.visDip) { visOverride[elIdx] = vis; visOverride[wrIdx] = vis; }
+      } else {
+        applyArmDir(W, shIdx, elIdx, wrIdx, cUa, cFa); // 反対側(この瞬間は突いていない側)は常時チャンバー
+      }
+    };
+    doSide(11, 13, 15, true, activeLeft);
+    doSide(12, 14, 16, false, !activeLeft);
+    const out = simFinalize(W);
+    const applyVis = (arr) => arr[0].map((p, i) => ({ x: p.x, y: p.y, z: p.z, visibility: visOverride[i] != null ? visOverride[i] : p.visibility }));
+    out.poseWorldLandmarks = [applyVis(out.poseWorldLandmarks)];
+    out.poseLandmarks = [applyVis(out.poseLandmarks)];
+    const wIdx = activeLeft ? 15 : 16;
+    const w = out.poseLandmarks[0][wIdx];
+    const f = { x: 0, y: 0, z: -1 }, s = activeLeft ? { x: -1, y: 0, z: 0 } : { x: 1, y: 0, z: 0 };
+    const hand = [makeHand({ x: w.x, y: w.y, z: 0 }, f, s, 0.12 * 1.4)]; // アクティブ(突き)側にだけ手を付与
+    out.leftHandLandmarks = activeLeft ? hand : [];
+    out.rightHandLandmarks = activeLeft ? [] : hand;
+    return out;
+  }
+  // 正拳突き(連続): 構え→左突き伸展→引き戻し→右突き→…をloop()に統合したアニメーションを開始する。
+  // simAnimator(now)をセットするだけで、実際の再生成はloop()側(cloneSimFrameの直前)が担う。
+  window.__simPunchCycle = (opts) => {
+    const o = opts || {};
+    const periodMs = o.periodMs > 0 ? o.periodMs : 1000;
+    const alternate = o.alternate !== false;
+    const visDip = o.visDip !== false;
+    const t0 = performance.now();
+    simAnimator = (now) => buildPosePunchFrame(now - t0, { periodMs, alternate, visDip });
+    simResult = simAnimator(t0); // 次のrAFを待たず最初のフレームも即時反映する
+    return simResult;
+  };
+  // 正拳突き(連続)の停止: simAnimator/simResultを両方nullに戻し、実カメラ経路(tracking中ならholistic
+  // 検出)に復帰させる。既存の解除ボタン(setSim(null)経路)とは独立に呼べる専用フック。
+  window.__simPunchStop = () => { simAnimator = null; simResult = null; };
+  // ヘッドレス検証用(読み取り専用): simResult/simAnimatorが現在セットされているか(true/false)を返す。
+  // __simPunchStop()後にsimResultが実際にnullへ戻ったことを外部から確認する手段が無かったため追加した。
+  window.__simAnimState = () => ({ hasSimResult: !!simResult, hasAnimator: !!simAnimator });
+
   // 上腕の向き(world)を数値取得。前方リーチなら z<0（カメラ方向 -Z）になるはず
   window.__armProbe = () => {
     if (!currentVrm) return null;
@@ -2062,6 +2221,7 @@
     const now = performance.now();
 
     let result = null;
+    if (simAnimator) simResult = simAnimator(now); // 動的シム(正拳突きサイクル等): 毎フレームsimResultを再生成
     if (simResult) {
       result = cloneSimFrame(simResult); // シミュレーション優先（カメラ不要）。毎フレーム新オブジェクト化
     } else if (tracking && holistic && video.videoWidth > 0 && video.currentTime !== lastVideoTime) {

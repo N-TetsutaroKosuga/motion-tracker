@@ -834,3 +834,191 @@ CONTRACT.mdが指定するreach-testハーネス(probe-avatar.mjs)のviewport(90
 修正後、`probe-avatar.mjs --media punch`は正常完了(70サンプル取得、NaN 0件、
 `|zProbe|>0.78`の発散0件、最大`|z|`=0.4441m)。修正後に`node test/sim/run.mjs`を
 2回追加実行し、いずれも**PASS=17 FAIL=0**(CSSのみの変更のためロジックへの影響なし)。
+
+## 14. h1タスク: 正拳突き(punch)シミュレーションポーズの実装
+
+### 14.1 静止ポーズ `buildPosePunch(side, extendDeg=85, handScale=1.4)`
+
+`avatar-depth.html`の`__simVis`直後(`__armProbe`直前)に実装。突き腕・引き手(チャンバー)とも
+「単位方向ベクトル×U/F」で座標を作るため、`dx²+dy²+dz²=U²`(上腕)/`F²`(前腕)が構成上厳密に
+成り立つ(自己無矛盾)。
+
+**突き腕(side側、既存`buildPoseReach`の片腕版と同一の数学)**:
+```
+punchDir(leftSide, θ) = ( (leftSide?+1:-1)·cosθ, 0, -sinθ )   (単位ベクトル)
+elbow = shoulder + U·punchDir
+wrist = elbow    + F·punchDir           (一直線に伸びる腕、方向は上腕と同じ)
+```
+`θ=extendDeg=85°`(既定)のとき:
+```
+理論値: elbowZ = -U·sin85° = -0.27×0.99619 = -0.26897
+理論値: wristZ = -(U+F)·sin85° = -0.52×0.99619 = -0.51802
+```
+拳の高さ(y)は肩の高さのまま(`buildPoseReach`と同じ規約、「理論値を単純に保つ」という要件どおり)。
+
+**引き手(チャンバー、反対側)— 閉形式の導出**:
+上腕・前腕とも矢状面(y-z平面)内のみで構成し、x=肩のxのまま(体側から外へは張り出さない)。
+```
+CHAMBER_UA_DEG = 20°, CHAMBER_FA_DEG = 50°   (avatar-depth.htmlの定数)
+chamberUaDir = (0,  cos(20°),  sin(20°))     (単位ベクトル。+y=下、+z=後方)
+chamberFaDir = (0,  cos(50°), -sin(50°))     (単位ベクトル。+y=下、-z=前方)
+elbow = shoulder + U·chamberUaDir
+wrist = elbow    + F·chamberFaDir
+```
+数値(shoulder.y=-0.45, shoulder.z=0を基準):
+```
+elbow.z = U·sin20°  = 0.27×0.34202 =  0.09235   (>0 ＝ 体より後ろ)
+elbow.y = -0.45 + U·cos20° = -0.45+0.27×0.93969 = -0.19628
+wrist.z = elbow.z - F·sin50° = 0.09235-0.25×0.76604 = -0.09916
+wrist.y = elbow.y + F·cos50° = -0.19628+0.25×0.64279 = -0.03558
+```
+`wrist.y≈-0.036`は腰の高さ(landmark 23/24のy=0)のすぐ上に来る(＝「腰脇」相当)。`wrist.z≈-0.099`は
+肩面よりわずかに前だが小さい値であり、「拳が脇腹に収まる」という設計意図と矛盾しない
+(絶対値が突き腕側のz変化量よりずっと小さいため、後述のboneWorldProbe判定`<+0.05`を十分満たす)。
+角度20°/50°は「体側に沿って下向き+やや後方」「前下方で拳が腰の高さに来る」という定性的要件を
+満たす値として選定した(前腕角50°は`elbow.y + F·cos(50°) ≈ 0`(腰の高さ)に近づく値から逆算)。
+CHAMBER_UA_DEG/CHAMBER_FA_DEGを変えても閉形式の構造(dx²+dy²+dz²=U²/F²)自体は変わらない。
+
+**手ランドマーク**: 突き腕の手首にのみ`makeHand`(fwd向き `f={0,0,-1}`、親指側は左右でミラー、
+`scale=0.12×handScale`)を付与する。引き手側は手ランドマーク無し(実測でも検出されないという
+d1診断と整合、`CONTRACT.md`該当節参照)。
+
+### 14.2 動的サイクル `buildPosePunchFrame(elapsedMs, opts)` / `__simPunchCycle`
+
+**方式**: 独自タイマーを持たず、`simAnimator`(モジュール変数、nullable関数)を`loop()`内で
+`simResult`取得の直前に呼ぶ形に統合した(`avatar-depth.html`の`loop()`、
+`if (simAnimator) simResult = simAnimator(now);`)。`cloneSimFrame`の意味論・実カメラ経路は不変。
+
+**時間分割**: `periodMs`を1punchの周期とし、`beatIndex=floor(elapsedMs/periodMs)`の偶奇で
+`alternate=true`(既定)なら左右を交互に切り替える(偶数=左が突き腕、奇数=右)。
+ビート内ローカル時刻`t=elapsedMs - beatIndex*periodMs`から
+`frac = (1-cos(2π·t/periodMs))/2`(半コサイン)を計算する。`frac`は`t=0`で0、
+`t=periodMs/2`で1(伸展ピーク)、`t=periodMs`で0(元のチャンバーに戻る)と滑らかに往復する。
+
+**アクティブ腕の方向補間(球面線形補間)**: アクティブ側(その瞬間の突き腕)は
+`slerpUnit3(chamberDir, punchDir(extendDeg=85°), frac)`で「チャンバー方向」から
+「伸展方向」まで単位ベクトルを球面線形補間する(`avatar-depth.html`の`slerpUnit3`)。
+単位ベクトル同士のslerpは常に単位ベクトルを返すため、`U`/`F`を掛けた結果は
+**アニメーション中の任意の瞬間で厳密に`dx²+dy²+dz²=U²/F²`を満たす**(静止時の2値だけでなく、
+遷移の全区間で骨長が一定に保たれる、単純な線形補間より強い性質)。非アクティブ側(その瞬間は
+突いていない側)は常にチャンバー方向で固定(`isActive`分岐、`avatar-depth.html`の`doSide`)。
+
+**visibilityディップ**: `visDip`が真のとき、アクティブ側の肘・手首のvisibilityを
+`vis = clamp(1 - 0.7·frac, 0.3, 1)`とし、frac(伸展位相)と完全に連動させて1.0→0.3→1.0と
+滑らかに往復させる(d1診断の実測「突き腕の肘/手首visが0.25〜0.5に低下」の再現)。肩・非アクティブ側は
+常に1.0のまま。手ランドマークもアクティブ側の手首にのみ付与し、ビート境界で自動的に付け替わる。
+
+**構え(両腕チャンバー)の扱い**: 特別な初期フェーズを設けていない。`frac=0`のとき
+`slerpUnit3(chamberDir, punchDir, 0) = chamberDir`となるため、各ビートの開始/終了の瞬間に
+アクティブ側も自然にチャンバー姿勢へ一致し、非アクティブ側は常にチャンバーのままなので、
+「構え(両腕チャンバー)→左伸展→引き戻し→右…」という時系列が式の構造から自動的に生まれる。
+
+### 14.3 `--use-angle=metal`が必要な理由(実測)
+
+`buildPosePunchFrame`のvisibilityディップは連続関数だが、実際にゲートへ反映されるのは
+`loop()`が実際にレンダリングした**離散フレーム**でサンプルした値のみである。
+headless Chromiumの既定ANGLE(software GL相当)では本ページのthree.js/VRM描画が**3〜5fps**
+程度しか出ず(実測、`scratchpad/quickcheck4.mjs`)、`periodMs=600`のような速い往復に対し
+サンプリングが疎になり、ビート境界とサンプル位相の対応が環境依存で暴れる
+(実測: 3.5fps環境で`totalFlips=132`、同じシナリオを`--use-angle=metal`適用後の100fps超環境では
+`22`に安定収束、3回連続実行しても`20〜22`の狭い範囲で再現)。`test/tracking/run.mjs`が
+既に採用している対策と同じもの(macOS実機ではANGLEをMetalバックエンドに切り替えることで
+実GPU相当の速度に戻る)を`test/sim/run.mjs`の`setupPage()`にも追加した。既存17ケースは
+いずれも「収束を待つ」設計(`pollConverge`)でfpsに依存しないため、この変更による既存ケースへの
+副作用は無い(3回連続実行で回帰なしを確認、§14.5参照)。
+
+### 14.4 テスト実行順序に依存する符号ロックの罠(`new-punch-static`で発見・回避)
+
+`resetAndCal(page)`(`__resetCalibration()`→`__setManualCal()`を**別々の**`page.evaluate()`
+呼び出しで実行する既存ヘルパー)の直後に`__simPunch(...)`を**別の**`page.evaluate()`で呼ぶと、
+直前のケースが残した`simResult`(例: `new-calibration-side-independent`が最後に設定した
+「右腕=前方75°リーチ」のポーズ)に対して、2回の`evaluate()`呼び出しの合間にブラウザの
+rAFループが割り込む余地がある。`__resetCalibration()`は`signState[idx].init`を`false`に
+戻すため、この割り込みフレームで`resolveSign`が**まだ新しいポーズが来ていない古いstale姿勢**を
+見て符号を確定させてしまう(`resolveSign`の「初回決定は無条件採用、以降はzMagが体側平面付近
+(`FLIP_ZMAG_THRESH`未満)でない限り凍結」というヒステリシス設計により、一度誤って確定した
+符号は静止ポーズでは二度と訂正されない)。
+
+これは`optional-fakedepth-sign`(§5.1)で既に発見・対処されていたのと**全く同じ種類の競合**だが、
+既存の全ケース(down/up/tpose/reach/cross等)は「正しい符号が常に`+1`」になる姿勢しか
+使っていなかったため、たとえ同じ競合が起きても`signState`の既定値(`__resetCalibration`後は
+`sign:1`)と偶然一致し、これまで顕在化していなかった。引き手(チャンバー)は本タスクで初めて
+「正しい符号が`-1`(後方)」になる姿勢であり、この潜在的な競合を初めて可視化した。
+
+**対応**: `new-punch-static`の各Phaseで、`__resetCalibration()`→`__setManualCal()`→
+(Phase2のみ`__setHandCal()`/`__setHfov()`)→`__simPunch()`を**単一の`page.evaluate()`**に
+まとめ、間にrAFフレームが挟まらないようにした(§5.1と同じ対処)。実測: 分離した状態では
+`right.elbowZ=-0.0924`(符号反転、FAIL)、原子化後は`right.elbowZ=+0.0923`(理論値と一致、PASS)を
+再現確認した。**製品コード(`resolveSign`等)は変更していない**(この種の初期化競合は
+理論上どの`resetAndCal`利用ケースにも起こりうるが、今回はテスト側の呼び出し粒度で
+確実に回避できるため、`resolveSign`自体への変更は本タスクのスコープ外とした)。
+
+### 14.5 静止版の理論値検証(Phase分離の理由込み)
+
+`__simPunch("left",85)`に`makeHand`で手ランドマークを付与すると、`HAND_ANCHOR_ENABLED`既定`true`の
+手アンカー機構が(手較正済みなら)作動する。`extendDeg=85`ではリーチ度`ρ=1-(lE+lW)/(U+F)≈0.91`が
+`HA.RHO_HI=0.65`を大きく超えるため、手アンカーは全重み(`w=1`)で作動し、`elbowZ`/`wristZ`を
+プレーンなチェーン理論値から2ボーンIK再構成値へ**上書き**する(実測: 較正込みだと
+`left.elbowZ=-0.194`/`wristZ=-0.286`となり理論値`-0.269`/`-0.518`と一致しない)。これは
+`regression-handanchor-elbowdeg-monotonic`が`elbowZ`ではなく`elbowDeg`だけを検証しているのと
+同じ理由による仕様上の帰結であり、バグではない。そのため`new-punch-static`は2フェーズに分割した:
+
+- **Phase1(手較正なし)**: `computeHandAnchorSide`は`D0`(`currentD0()`)が未較正だと
+  `quality=false`のままプレーンなチェーン値へフォールバックする(既存仕様、d2診断で検証済み)。
+  この状態でチェーン理論値と`boneWorldProbe`(前後)を検証する。
+- **Phase2(手較正あり、`HAND_CAL_FIXTURE`)**: `handAnchor.left.r≈handScale(1.4)`のみを検証する。
+
+**実測(3回連続実行、いずれも同一値でPASS)**:
+```
+Phase1: left.elbowZ=-0.2690(理論-0.2690) left.wristZ=-0.5180(理論-0.5180)
+        right.elbowZ=+0.0923(理論+0.0923, >0.03要求を満たす)
+        boneWorldProbe: punchDz=+0.20〜+0.24(要>0.15) chamberDz=-0.32〜-0.45(要<0.05)
+Phase2: handAnchor.left.r=1.4000(理論1.4)
+```
+
+### 14.6 動的サイクルの検証設計(`new-punch-cycle`)
+
+`periodMs=600`で約3秒(実測elapsedMs≈3.1〜3.4秒、≈5〜6punch相当)実行し、100ms間隔で30回
+`__zProbe()`をサンプルする。手アンカー(`HAND_ANCHOR_ENABLED`)はテスト開始時に一時的に
+`__setHandAnchor(false)`で無効化し、終了時に`true`へ復元する: 有効なままだと`gatedFuseAxis`が
+肘のx/y軸にも独立したゲートキー(`"13x"`/`"13y"`等)を追加するため、1punchあたりの
+フリップ数が「肘・手首(z)各1キー×2」の理論値`4`から`8`に倍増し、`CONTRACT.md`が例示する
+「1punchあたり≤4」との対応が付けにくくなるため(手アンカー自体の正しさは`new-punch-static`で
+別途検証済み)。
+
+**フリップ数の理論**: `vis=1→0.3→1`の半コサイン往復は`HZ.VIS_GATE_MIN(0.5)`を1回(凍結開始)・
+`HZ.VIS_GATE_EXIT(0.6)`を1回(凍結解除)、合計2回横切る。手アンカー無効時はアクティブ側の
+肘・手首(z)の2キーのみがこのvisを見るため、**1punchあたり正確に4フリップ**になる
+(`--use-angle=metal`導入後の100fps超環境で3回連続実行し、いずれも`totalFlips=20`前後
+(elapsedMs/600×4の理論値に近い値)で安定することを確認済み)。判定は
+`0 < totalFlips ≤ ceil(elapsedMs/periodMs)×4×1.5`(ビート境界とサンプリングのずれの余裕として
+1.5倍)。
+
+**実測(3回連続実行)**:
+```
+run1: elapsedMs=3276 totalFlips=22 gateFlips={13:6,14:5,15:6,16:5}
+run2: elapsedMs=3117 totalFlips=20 gateFlips={13:6,14:4,15:6,16:4}
+run3: elapsedMs=3085 totalFlips=20 gateFlips={13:6,14:4,15:6,16:4}
+```
+いずれも`|elbowZ|,|wristZ|<0.78`で有界・NaN無し・`__simPunchStop()`後は
+`__simAnimState()`が`{hasSimResult:false,hasAnimator:false}`(実カメラ経路へ復帰)を確認した。
+
+### 14.7 `__resetCalibration`とアニメーション再生の独立性(検討・方針)
+
+**方針(採用): 較正リセットとアニメ再生は独立の関心事とし、`__resetCalibration()`は
+`simAnimator`を一切変更しない。停止は「解除」系(`setSim`経由の全ボタン)と`__simPunchStop()`の
+2経路のみに限定する。**
+
+理由:
+1. 較正(骨長・手アンカー・フィルタ状態)とシミュレーション対象ポーズは直交する関心事であり、
+   既存の`__sim*`系フック(`__simReach`等)も較正状態を変更しない/較正リセットもポーズを
+   変更しない、という対称性が既に成り立っている。アニメーションだけ例外的に較正リセットで
+   止まる仕様にすると、この対称性が崩れ「較正だけやり直したいがポーズ再生は続けたい」
+   (例: サイクル再生中に手動較正をやり直すワークフロー)を阻害する。
+2. 実測で確認した通り(`scratchpad/verify_resetcal_independence.mjs`)、`__resetCalibration()`を
+   呼んでも`simAnimator`は生き続け、その後も`__zProbe().cal`が(較正リセット後の自動較正により)
+   独立して更新され続けることを確認した。両者が独立していても副作用や矛盾は生じない
+   (較正リセット後は単に`calStatus="default"`から自動較正が再開されるだけで、
+   アニメーション自体の座標計算には一切影響しない)。
+3. 停止経路を「解除」系+`__simPunchStop()`の2つに絞ることで、ユーザー/テストコードにとって
+   「アニメを止めたいなら明示的に止める」という単純なメンタルモデルになる。

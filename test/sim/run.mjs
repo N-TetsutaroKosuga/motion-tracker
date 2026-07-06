@@ -203,7 +203,19 @@ async function setupPage() {
   const { chromium } = await import("playwright");
   const server = await startStaticServer(REPO_ROOT);
   const { port } = server.address();
-  const browser = await chromium.launch({ headless: !HEADED });
+  const browser = await chromium.launch({
+    headless: !HEADED,
+    args: [
+      // headless既定のANGLE(software GL相当)だと本ファイルのthree.js/VRMレンダリングが
+      // 3〜4fps程度しか出ず(実測)、正拳突きサイクル(new-punch-cycle、periodMs=600の高速な
+      // visibility往復)のようにフレームレート依存の挙動を検証するケースで閾値を跨ぐ回数が
+      // 環境依存で暴れる(実測: 3.5fps時にtotalFlips=132、100fps超では22に安定収束)。
+      // macOSではANGLEをMetalバックエンドに切り替えることで実GPU相当の速度(100fps超)に戻る
+      // (test/tracking/run.mjsが既に採用している対策と同じもの)。Linux CIでは効果が無い
+      // 可能性があるが無害なだけの指定として付与する。
+      "--use-angle=metal",
+    ],
+  });
   const context = await browser.newContext();
   const page = await context.newPage();
   page.on("console", (msg) => {
@@ -997,6 +1009,194 @@ const CASES = [
           "reachDeg=0(左、Tポーズ相当でz=0固定)とreachDeg=75(右、|Δz|=U·sin75°≈0.2608>>0.06で常時棄却)を" +
           "同時に流す。左右独立ゲートが機能していれば左のサンプルだけが採用され、理論値にほぼ厳密一致するはず。",
         "理論L_ua/L_fa(左のみ寄与)": `${U} / ${F}`,
+      };
+    },
+  },
+  {
+    // h1タスク新規ケース: 正拳突き(punch)静止ポーズ。buildPosePunch("left",85)は
+    //   突き腕(左, 11-13-15): buildPoseReachの片腕版と同じ数学(elbowZ=-U*sinθ, wristZ=-(U+F)*sinθ)。
+    //   引き手(右, 12-14-16, チャンバー): セグメント長U/F厳守の閉形式(avatar-depth.htmlのchamberUaDir/
+    //   chamberFaDir、導出はexpectations.md参照)。elbowZ=+U*sin(20°)>0(体より後ろ)。
+    // Phase1/Phase2に分けているのは、makeHandで手ランドマークを付与するとHAND_ANCHOR_ENABLED既定trueの
+    // 手アンカー機構が(手較正済みなら)作動し、extendDeg=85でのリーチ度ρが高いため全重み(w=1)で
+    // elbowZ/wristZをプレーンなチェーン理論値から2ボーンIK再構成値へ上書きしてしまうため
+    // (実測: 較正ありだとleft.elbowZ=-0.194/wristZ=-0.286で理論値-0.269/-0.518と一致しない)。
+    // 手較正を注入しない(=D0未確定でcomputeHandAnchorSideがquality=false経路にフォールバックする、
+    // testSurface.md/d2診断の既存仕様どおり)Phase1でチェーン理論値とboneWorldProbeを検証し、
+    // 手較正込みのPhase2でr≈handScale(1.4)のみを検証する(regression-handanchor-elbowdeg-monotonicが
+    // elbowZでなくelbowDegだけを見ているのと同じ理由の切り分け)。
+    id: "new-punch-static",
+    desc:
+      "__simPunch(\"left\",85): 突き腕(左)elbowZ/wristZが理論値、引き手(右)elbowZ>0(体より後ろ)、" +
+      "boneWorldProbeで前後が正しい、手アンカー較正時はr≈1.4",
+    requiredHooks: ["__resetCalibration", "__setManualCal", "__simPunch", "__zProbe", "__boneWorldProbe", "__setHandCal"],
+    async run(page) {
+      // Phase 1: 手アンカー未較正(既定)。チェーン理論値とboneWorldProbe(前後)を検証する。
+      // reset→cal→simPunchを単一のpage.evaluateで原子的に実行する: 別々のevaluateに分けると、
+      // 直前のケースが残したstale simResult(例: 前ケースの右腕=前方75°リーチ)に対して
+      // ブラウザのrAFループが割り込み、resetでinit=falseになった直後のsignState(resolveSignの
+      // ヒステリシス)がそのstaleな前方ポーズを見て誤った符号にロックしてしまうことがある
+      // (§5.1 optional-fakedepth-signと同種の既知の罠)。チャンバー(引き手)は本ケースが初めて
+      // 「正しい符号が-1(後方)」になるケースのため、この罠が実測で顕在化した
+      // (既存ケースは正しい符号が常に+1のため、誤ロックされても偶然一致し顕在化しなかった)。
+      await page.evaluate(
+        ({ ua, fa, side, deg }) => {
+          window.__resetCalibration();
+          window.__setManualCal(ua, fa);
+          window.__simPunch(side, deg);
+        },
+        { ua: U, fa: F, side: "left", deg: 85 }
+      );
+      const conv1 = await pollConverge(page);
+      const bw1 = conv1.bw || (await page.evaluate((names) => window.__boneWorldProbe(names), ["leftHand", "rightHand", "chest"]));
+
+      // Phase 2: 手アンカー較正済み(HAND_CAL_FIXTURE, handScale基準1.0)。r≈1.4のみを検証する。同じ理由で原子的に実行する。
+      await page.evaluate(
+        ({ ua, fa, side, deg, cal }) => {
+          window.__resetCalibration();
+          window.__setManualCal(ua, fa);
+          window.__setHandCal(cal);
+          if (typeof window.__setHfov === "function") window.__setHfov(60);
+          window.__simPunch(side, deg);
+        },
+        { ua: U, fa: F, side: "left", deg: 85, cal: HAND_CAL_FIXTURE }
+      );
+      const conv2 = await pollUntilStable(page);
+
+      return { z1: conv1.z, bw1, r: conv2.probe?.handAnchor?.left?.r ?? null };
+    },
+    assert(result) {
+      const theory = {
+        "left.elbowZ": { value: reachElbowZ(85), tol: 0.1, mode: "rel" },
+        "left.wristZ": { value: reachWristZ(85), tol: 0.1, mode: "rel" },
+      };
+      const base = assertFields(result.z1, theory);
+      const rightElbowZ = result.z1?.right?.elbowZ;
+      const rightElbowBack = rightElbowZ != null && rightElbowZ > 0.03; // FALLBACK_THRESH(0.03)超のマージンで「有意に後ろ」
+      const bw = result.bw1 || {};
+      const punchDz = bw.leftHand && bw.chest ? bw.leftHand.z - bw.chest.z : null;
+      const chamberDz = bw.rightHand && bw.chest ? bw.rightHand.z - bw.chest.z : null;
+      const punchFwd = punchDz != null && punchDz > 0.15;
+      const chamberNotFwd = chamberDz != null && chamberDz < 0.05;
+      const rOk = within(result.r, 1.4, 0.1, "rel");
+      const pass = base.pass && rightElbowBack && punchFwd && chamberNotFwd && rOk;
+      const detail =
+        `${base.detail} / right.elbowZ=${fmt(rightElbowZ)}(要>0.03) / ` +
+        `boneWorldProbe: punchDz=${fmt(punchDz)}(要>0.15) chamberDz=${fmt(chamberDz)}(要<0.05) / ` +
+        `handAnchor.left.r=${fmt(result.r)}(理論1.4, ±10%)`;
+      return {
+        pass,
+        detail,
+        actual: { z1: result.z1, bw1: result.bw1, r: result.r },
+        expected: {
+          "left.elbowZ": reachElbowZ(85),
+          "left.wristZ": reachWristZ(85),
+          "right.elbowZ": "> +0.03",
+          punchDz: "> +0.15",
+          chamberDz: "< +0.05",
+          r: "1.4 ±10%",
+        },
+      };
+    },
+    dryRunPreview() {
+      const chamberElbowZ = U * Math.sin(deg2rad(20));
+      return {
+        "left(突き).elbowZ": reachElbowZ(85).toFixed(4),
+        "left(突き).wristZ": reachWristZ(85).toFixed(4),
+        "right(引き手).elbowZ": "+" + chamberElbowZ.toFixed(4) + " (>0.03)",
+        note: "CHAMBER_UA_DEG=20°/CHAMBER_FA_DEG=50°の閉形式導出はexpectations.md参照。Phase1(手較正無し)/Phase2(手較正あり)の2段階で検証。",
+      };
+    },
+  },
+  {
+    // h1タスク新規ケース: 正拳突き(punch)連続サイクル。__simPunchCycle({periodMs:600})を
+    // 約3秒(≈5突き)実行しながら100ms間隔でプローブし、NaN無し・|z|<1.5*(U+F)で有界・
+    // visディップ(1.0→0.3→1.0、extend位相に連動)中にヒステリシスゲートが作動する
+    // (gateFlips>0)がフリップ回数は有界であること、停止(__simPunchStop)後にsimResult/simAnimator
+    // が両方nullに戻ることを検証する。
+    // 手アンカー(HAND_ANCHOR_ENABLED既定true)はテスト開始時に一時的に無効化する:
+    // 有効なままだと肘のx/y軸にも独立したゲートキー("13x"/"13y"等)が追加され、1punchあたりの
+    // フリップ数がelbow/wrist(zのみ)の理論値4から8に倍増し、CONTRACT.mdが例示する
+    // 「1punchあたり≤4」との対応が付けにくくなるため(手アンカー自体の正しさはnew-punch-staticで
+    // 別途検証済み)。テスト終了時に必ず元(true)へ戻す(後続ケースへの影響を残さないため)。
+    id: "new-punch-cycle",
+    desc:
+      "__simPunchCycle({periodMs:600})を約3秒実行: NaN無し・|z|<0.78で有界・visディップ中に" +
+      "ヒステリシスゲートが作動(gateFlips>0)しつつフリップ回数は有界、停止後はsimResult/simAnimatorがnull",
+    requiredHooks: [
+      "__resetCalibration",
+      "__setManualCal",
+      "__setHandAnchor",
+      "__simPunchCycle",
+      "__simPunchStop",
+      "__simAnimState",
+      "__zProbe",
+      "__gateProbe",
+    ],
+    async run(page) {
+      await resetAndCal(page);
+      await evalHook(page, "__setHandAnchor", [false]);
+      const periodMs = 600;
+      const t0 = await page.evaluate((o) => { window.__simPunchCycle(o); return performance.now(); }, { periodMs });
+      const animDuring = await page.evaluate(() => window.__simAnimState());
+
+      const samples = [];
+      for (let i = 0; i < 30; i++) {
+        await sleep(100);
+        // eslint-disable-next-line no-await-in-loop
+        samples.push(await page.evaluate(() => window.__zProbe()));
+      }
+      const [tEnd, gate] = await page.evaluate(() => [performance.now(), window.__gateProbe()]);
+      const elapsedMs = tEnd - t0;
+
+      await evalHook(page, "__simPunchStop", []);
+      const animAfter = await page.evaluate(() => window.__simAnimState());
+      await evalHook(page, "__setHandAnchor", [true]); // 後続ケースを汚染しないよう必ず復元
+
+      return { samples, gate, elapsedMs, periodMs, animDuring, animAfter };
+    },
+    assert(result) {
+      const nums = [];
+      for (const s of result.samples) {
+        for (const side of ["left", "right"]) {
+          const d = s?.[side] || {};
+          nums.push(d.elbowZ, d.wristZ);
+        }
+      }
+      const finiteVals = nums.filter((v) => v != null);
+      const allFinite = finiteVals.length > 0 && finiteVals.every((v) => Number.isFinite(v));
+      const bound = (U + F) * 1.5;
+      const bounded = finiteVals.every((v) => Math.abs(v) < bound);
+      const totalFlips = Object.values(result.gate?.gateFlips || {}).reduce((a, b) => a + b, 0);
+      const punchesLo = Math.floor(result.elapsedMs / result.periodMs);
+      const punchesHi = Math.ceil(result.elapsedMs / result.periodMs);
+      // 手アンカー無効化時はelbow/wrist(z)各1キー×(凍結開始+解除)の2回=1punchあたり4フリップの設計
+      // (buildPosePunchFrameのvis=1→0.3→1の半コサイン往復がHZ.VIS_GATE_MIN/EXITの両方を1回ずつ跨ぐ、
+      // --use-angle=metalで100fps超なら実測でも安定して4×punch数±1に収まることを確認済み)。
+      // ビート境界と100msサンプリングのずれ・往復開始時の半端分の余裕として1.5倍を掛けた値を上限とする。
+      const flipBound = Math.max(8, punchesHi * 4 * 1.5);
+      const gateWorked = totalFlips > 0 && totalFlips <= flipBound;
+      const animStartedOk = result.animDuring?.hasSimResult === true && result.animDuring?.hasAnimator === true;
+      const stoppedClean = result.animAfter?.hasSimResult === false && result.animAfter?.hasAnimator === false;
+      const pass = allFinite && bounded && gateWorked && animStartedOk && stoppedClean;
+      const detail =
+        `samples=${result.samples.length} allFinite=${allFinite} bounded(<${bound.toFixed(3)})=${bounded} maxAbs=${fmt(Math.max(...finiteVals.map(Math.abs)))} / ` +
+        `elapsedMs=${fmt(result.elapsedMs)} punches≈${punchesLo}-${punchesHi} totalFlips=${totalFlips}(要 0<flips≤${fmt(flipBound)}) gateFlips=${JSON.stringify(result.gate?.gateFlips)} / ` +
+        `animDuring=${JSON.stringify(result.animDuring)} animAfterStop=${JSON.stringify(result.animAfter)}`;
+      return {
+        pass,
+        detail,
+        actual: { totalFlips, gateFlips: result.gate?.gateFlips, animDuring: result.animDuring, animAfter: result.animAfter },
+        expected: { allFinite: true, boundedBy: bound, gateFlips: `0 < flips <= ${flipBound}`, animDuring: { hasSimResult: true, hasAnimator: true }, animAfter: { hasSimResult: false, hasAnimator: false } },
+      };
+    },
+    dryRunPreview() {
+      return {
+        note:
+          "periodMs=600で約3秒(≈5突き)実行。手アンカーを一時的に無効化し、1punchあたり" +
+          "elbow/wrist(z)の凍結開始+解除=4フリップの設計値を基準に、ビート境界のずれを見込んだ" +
+          "1.5倍を上限とする。--use-angle=metal(100fps超)前提の設計(低fpsだとエイリアシングで" +
+          "フリップ数が環境依存になることを実測確認済み、詳細は本タスクの報告参照)。",
       };
     },
   },
