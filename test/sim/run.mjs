@@ -499,8 +499,22 @@ const CASES = [
     },
   },
   {
+    // g-fix2タスク訂正: __simCross(deg)は突き腕と同じmediapipe idx11/13/15を交差腕として使う
+    // (buildPoseCross実装、W[13]/W[15]を書き換える)。__zProbe().left(mediapipe添字基準の命名、
+    // idx13/15)はこの交差腕そのものなので z<0チェックはそのままで正しい。一方__armProbe()が返す
+    // "left"/"right"はVRMヒューマノイドボーン名であり、g-fix1タスクのKalidokitミラー規約修正
+    // (mediapipe idx11/13→VRM"rightUpperArm"、new-punch-staticの訂正時と同じ根拠)により、
+    // 交差腕(mediapipe idx11/13/15)はVRMの"rightUpperArm"/"rightLowerArm"を駆動する。旧版は
+    // armProbe().leftを見ており、g-fix1タスクのL/R入替修正前はこれで恰も「交差腕の反転」を検出できて
+    // いたが、実際には「入替前バグにより無関係な(静止した)反対側の腕にy成分だけが誤って注入され
+    // 偶然大きく振れた」ことを検出していただけだったと判明した(本タスクでgit stash比較により実測確認:
+    // 修正前armProbe().left.x=-0.27(flipped=true)・修正後armProbe().left.x=+0.05(flipped=false、
+    // ほぼ無反応)。一方修正後armProbe().right.x はtpose基準-1→cross(40)+0.63と明確に反転する)。
+    // 本タスクで.right基準に訂正する。
     id: "new-cross-40",
-    desc: "__simCross(40): 左肘/手首zが負(前方)、__armProbeで左腕方向xが対側符号、NaN/爆発なし",
+    desc:
+      "__simCross(40): z1.left(mediapipe添字13/15)elbowZ/wristZが負(前方)、" +
+      "__armProbe().right(VRMボーン名、g-fix1タスクのミラー規約修正後は交差腕を表す)のx符号が反転、NaN/爆発なし",
     requiredHooks: ["__resetCalibration", "__setManualCal", "__simCross", "__zProbe", "__armProbe", "__simPose"],
     async run(page) {
       // 基準姿勢(tpose)での左腕方向xを符号の基準として取得
@@ -526,16 +540,16 @@ const CASES = [
       const allFinite = nums.every((v) => v == null || Number.isFinite(v));
       const boundOk = nums.every((v) => v == null || Math.abs(v) < (U + F) * 1.5);
       const zNeg = (p?.left?.elbowZ ?? 0) < -0.01 && (p?.left?.wristZ ?? 0) < -0.01;
-      const baseX = result.baseArm?.left?.x;
-      const crossX = result.arm?.left?.x;
+      const baseX = result.baseArm?.right?.x;
+      const crossX = result.arm?.right?.x;
       const flipped =
         baseX != null && crossX != null && Math.sign(baseX) !== 0 && Math.sign(crossX) !== 0 && Math.sign(baseX) !== Math.sign(crossX);
       const pass = allFinite && boundOk && zNeg && flipped;
       const detail =
-        `left.elbowZ=${fmt(p?.left?.elbowZ)} left.wristZ=${fmt(p?.left?.wristZ)} ` +
-        `baseArm.left.x=${fmt(baseX)} crossArm.left.x=${fmt(crossX)} flipped=${flipped} ` +
+        `z1.left.elbowZ=${fmt(p?.left?.elbowZ)} z1.left.wristZ=${fmt(p?.left?.wristZ)} ` +
+        `armProbe baseArm.right.x=${fmt(baseX)} crossArm.right.x=${fmt(crossX)} flipped=${flipped} ` +
         `finite=${allFinite} bounded=${boundOk}`;
-      return { pass, detail, actual: { left: p?.left, baseX, crossX }, expected: { zNegative: true, xSignFlipped: true, finite: true } };
+      return { pass, detail, actual: { "z1.left": p?.left, baseX, crossX }, expected: { zNegative: true, xSignFlipped: true, finite: true } };
     },
     dryRunPreview() {
       return {
@@ -550,50 +564,74 @@ const CASES = [
     // 恒久回帰ガード。__boneWorldProbeの実測値(handZ-chestZ)を直接判定基準にする点が
     // new-cross-40(__armProbeのx符号反転のみを見る)と異なり、絶対的な前後方向そのものを検証する。
     id: "new-absolute-forward",
-    desc: "__simReach(60)(両腕): 左右ともhandZ-chestZが大きく正(=前方)。tpose基準値との対比も記録。背面リーチ回帰の恒久ガード",
+    desc:
+      "__simReach(60)(両腕): 左右ともhandZ-chestZが大きく正(=前方)かつ|handX-shoulderX|が小さい(=横に" +
+      "伸びていない)。tpose基準値との対比も記録。背面リーチ回帰・横伸びリーチ回帰の恒久ガード",
     requiredHooks: ["__resetCalibration", "__setManualCal", "__simReach", "__simPose", "__boneWorldProbe"],
     async run(page) {
-      // tpose基準値(参考。前方でも後方でもない中立姿勢でのhandZ-chestZ)
+      const bwNames = ["leftHand", "rightHand", "leftShoulder", "rightShoulder", "chest"];
+      // tpose基準値(参考。前方でも後方でもない中立姿勢でのhandZ-chestZ/横方向オフセット)
       await resetAndCal(page);
       await evalHook(page, "__simPose", ["tpose"]);
       const convT = await pollConverge(page);
-      const bwT = convT.bw || (await page.evaluate(() => window.__boneWorldProbe()));
+      const bwT = await page.evaluate((names) => window.__boneWorldProbe(names), bwNames);
 
       // 本題: 両腕前方リーチ60°
       await resetAndCal(page);
       await evalHook(page, "__simReach", [60]);
       const convR = await pollConverge(page);
-      const bwR = convR.bw || (await page.evaluate(() => window.__boneWorldProbe()));
+      const bwR = await page.evaluate((names) => window.__boneWorldProbe(names), bwNames);
 
       const dz = (bw) => ({ left: bw.leftHand.z - bw.chest.z, right: bw.rightHand.z - bw.chest.z });
-      return { dzTpose: dz(bwT), dzReach60: dz(bwR), convergedT: convT.converged, convergedR: convR.converged };
+      const ox = (bw) => ({ left: bw.leftHand.x - bw.leftShoulder.x, right: bw.rightHand.x - bw.rightShoulder.x });
+      return {
+        dzTpose: dz(bwT), dzReach60: dz(bwR), oxTpose: ox(bwT), oxReach60: ox(bwR),
+        convergedT: convT.converged, convergedR: convR.converged,
+      };
     },
     assert(result) {
-      // 閾値+0.15m の根拠(expectations.md参照): 修正後の実測はleft/rightとも+0.334〜+0.336mに
-      // 3回の独立実行で収束(理論チェーン長(U+F)*sin60°=0.4503mに対しVRMボーンスケールを反映した値)。
-      // 修正前バグ値は-0.385m前後(符号が逆)だった。+0.15mは両者を確実に判別しつつ、
-      // 実行間のフィルタ収束ばらつきを吸収する余裕を持たせた値。
-      const THRESH = 0.15;
-      const passL = result.dzReach60.left > THRESH;
-      const passR = result.dzReach60.right > THRESH;
+      // 前方閾値+0.25m(旧+0.15mから引き上げ)の根拠(expectations.md参照): 修正後の実測はleft/rightとも
+      // +0.334〜+0.336mに3回の独立実行で収束(理論チェーン長(U+F)*sin60°=0.4503mに対しVRMボーン
+      // スケールを反映した値、実測±0.335台は「+0.35m級」の真の突き値と同じオーダー)。修正前バグ値は
+      // -0.385m前後(符号が逆)だった。+0.25mは実測+0.335に対し約25%のマージンを保ちつつ、旧+0.15mより
+      // 大幅に厳しくした値(旧値は「符号が正しいか」しか事実上見ていなかった)。
+      const FWD_THRESH = 0.25;
+      // 横方向上限0.40mの根拠: reach60(正しいポーズ)の実測|offset|は±0.304(3回の独立実行で確認、
+      // g-fix2タスクでのscratchpad実測)。これはreachDeg=60°がreachDeg=85°(真の突き相当、実測±0.105)より
+      // 浅い角度のため幾何的に横方向成分が大きく残る自然な値であり、バグではない。0.40mは実測0.304に
+      // 約24%のマージンを持たせつつ、tpose(全開横方向、実測±0.519)を確実に弾ける値。このケースが
+      // 主眼としている「背面リーチ」バグはreach60が左右対称ポーズのため元々このバグの影響を受けない
+      // (g-fix1タスクのL/R入替修正の前後で同一値、本タスクでgit stash比較により確認済み)。
+      // ここでの横方向チェックは主として将来の別回帰に対する防御的追加であり、本タスクの主対象である
+      // 「正拳突きの横伸びバグ」の主回帰ガードはnew-punch-static/new-punch-reach85/new-punch-ui-autocalが担う。
+      const LAT_THRESH = 0.4;
+      const passL = result.dzReach60.left > FWD_THRESH && Math.abs(result.oxReach60.left) < LAT_THRESH;
+      const passR = result.dzReach60.right > FWD_THRESH && Math.abs(result.oxReach60.right) < LAT_THRESH;
       const pass = passL && passR;
       const detail =
-        `reach60: left=${fmt(result.dzReach60.left)} right=${fmt(result.dzReach60.right)} (要 > +${THRESH}) / ` +
-        `tpose基準: left=${fmt(result.dzTpose.left)} right=${fmt(result.dzTpose.right)} / ` +
+        `reach60: dz left=${fmt(result.dzReach60.left)} right=${fmt(result.dzReach60.right)} (要 > +${FWD_THRESH}) / ` +
+        `ox left=${fmt(result.oxReach60.left)} right=${fmt(result.oxReach60.right)} (要 |x| < ${LAT_THRESH}) / ` +
+        `tpose基準: dz left=${fmt(result.dzTpose.left)} right=${fmt(result.dzTpose.right)} ` +
+        `ox left=${fmt(result.oxTpose.left)} right=${fmt(result.oxTpose.right)} / ` +
         `converged(tpose/reach60)=${result.convergedT}/${result.convergedR}`;
       return {
         pass,
         detail,
-        actual: result.dzReach60,
-        expected: { left: `> +${THRESH}`, right: `> +${THRESH}`, note: "handZ-chestZ (VRM world, m)" },
+        actual: { dz: result.dzReach60, ox: result.oxReach60 },
+        expected: {
+          dz: { left: `> +${FWD_THRESH}`, right: `> +${FWD_THRESH}` },
+          ox: { left: `|x| < ${LAT_THRESH}`, right: `|x| < ${LAT_THRESH}` },
+          note: "handZ-chestZ / handX-shoulderX (VRM world, m)",
+        },
       };
     },
     dryRunPreview() {
       return {
         note:
           "理論チェーン長(U+F)*sin60°=0.4503m(MediaPipe座標)に対応するVRMワールド換算値。" +
-          "修正後の実測ではleft/rightとも+0.334〜+0.336mに収束(3回の独立実行で確認、expectations.md参照)。" +
-          "閾値+0.15mは旧バグ値(-0.385m前後)を確実に判別しつつ実行間ばらつきを吸収するための余裕を持たせた値。",
+          "修正後の実測ではdz(前後)がleft/rightとも+0.334〜+0.336mに収束、ox(横方向オフセット)は" +
+          "±0.304程度(3回の独立実行で確認、expectations.md参照)。閾値dz>+0.25m・|ox|<0.40mは" +
+          "旧バグ値(dz=-0.385m前後)を確実に判別しつつ実行間ばらつきを吸収するための余裕を持たせた値。",
         "reach60理論チェーン長(U+F)*sin60°": ((U + F) * Math.sin(deg2rad(60))).toFixed(4),
       };
     },
@@ -1025,10 +1063,22 @@ const CASES = [
     // testSurface.md/d2診断の既存仕様どおり)Phase1でチェーン理論値とboneWorldProbeを検証し、
     // 手較正込みのPhase2でr≈handScale(1.4)のみを検証する(regression-handanchor-elbowdeg-monotonicが
     // elbowZでなくelbowDegだけを見ているのと同じ理由の切り分け)。
+    // g-fix2タスク注記: __simPunch("left",85)の"left"はbuildPosePunchの引数(MediaPipe添字11/13/15を
+    // 突き腕として使う指定)であり、__zProbe()が返す"left"/"right"キーもこのMediaPipe添字基準の命名
+    // (idx13/15="left", idx14/16="right")である。一方__boneWorldProbeが返すのはVRMヒューマノイド
+    // ボーン名("leftHand"/"rightHand")であり、Kalidokitのミラー規約(mediapipe idx11/13→rp.RightUpperArm、
+    // 12/14→rp.LeftUpperArm。g-fix1タスクのarmSagittal/armSlerpFactor添字入替の根拠と同じ)により、
+    // mediapipe idx11/13/15(このケースの突き腕)はVRMの"rightHand"/"rightUpperArm"を駆動する
+    // ("leftHand"ではない)。実測で確認済み(scratchpad probe1/probe3、本タスク): __simPunch("left",85)後、
+    // bw.rightHand.z-bw.chest.z=+0.378(前方)・bw.leftHand.z-bw.chest.z=-0.055(引き手)。
+    // g-fix1タスクのL/R入替修正前は逆(bw.leftHandが前方)だったため、本ケースは当時その誤った対応で
+    // 書かれていた(punchDz/chamberDzがbw.leftHand/bw.rightHandを参照)。本タスクで実測どおりに
+    // 訂正する(該当行のコメント参照)。
     id: "new-punch-static",
     desc:
-      "__simPunch(\"left\",85): 突き腕(左)elbowZ/wristZが理論値、引き手(右)elbowZ>0(体より後ろ)、" +
-      "boneWorldProbeで前後が正しい、手アンカー較正時はr≈1.4",
+      "__simPunch(\"left\",85): 突き腕(z1.left, mediapipe添字13/15)elbowZ/wristZが理論値、" +
+      "引き手(z1.right, mediapipe添字14/16)elbowZ>0(体より後ろ)、" +
+      "boneWorldProbe(VRMボーン名, 突き腕=rightHand/引き手=leftHand)で前後・横方向が正しい、手アンカー較正時はr≈1.4",
     requiredHooks: ["__resetCalibration", "__setManualCal", "__simPunch", "__zProbe", "__boneWorldProbe", "__setHandCal"],
     async run(page) {
       // Phase 1: 手アンカー未較正(既定)。チェーン理論値とboneWorldProbe(前後)を検証する。
@@ -1048,7 +1098,12 @@ const CASES = [
         { ua: U, fa: F, side: "left", deg: 85 }
       );
       const conv1 = await pollConverge(page);
-      const bw1 = conv1.bw || (await page.evaluate((names) => window.__boneWorldProbe(names), ["leftHand", "rightHand", "chest"]));
+      // pollConverge()の既定__boneWorldProbe()呼び出しはshoulder系を含まないため(収束待ちの対象自体には
+      // 影響しない=hand/chestの収束を見れば十分)、横方向判定に必要なshoulder座標は収束後に別途明示取得する。
+      const bw1 = await page.evaluate(
+        (names) => window.__boneWorldProbe(names),
+        ["leftHand", "rightHand", "leftShoulder", "rightShoulder", "chest"]
+      );
 
       // Phase 2: 手アンカー較正済み(HAND_CAL_FIXTURE, handScale基準1.0)。r≈1.4のみを検証する。同じ理由で原子的に実行する。
       await page.evaluate(
@@ -1074,15 +1129,29 @@ const CASES = [
       const rightElbowZ = result.z1?.right?.elbowZ;
       const rightElbowBack = rightElbowZ != null && rightElbowZ > 0.03; // FALLBACK_THRESH(0.03)超のマージンで「有意に後ろ」
       const bw = result.bw1 || {};
-      const punchDz = bw.leftHand && bw.chest ? bw.leftHand.z - bw.chest.z : null;
-      const chamberDz = bw.rightHand && bw.chest ? bw.rightHand.z - bw.chest.z : null;
-      const punchFwd = punchDz != null && punchDz > 0.15;
+      // g-fix2タスク訂正: 突き腕(mediapipe idx11/13/15)はVRMの"rightHand"を駆動する(このケース冒頭の注記・
+      // 実測参照)。旧版はbw.leftHand/bw.rightHandを逆に参照しており(g-fix1タスクのL/R入替修正で
+      // 顕在化・本タスクで発見、実測: 旧参照だとpunchDz=-0.055(FAIL) chamberDz=+0.378(FAIL))、
+      // 本タスクで実測どおりに訂正した。
+      const punchDz = bw.rightHand && bw.chest ? bw.rightHand.z - bw.chest.z : null;
+      const chamberDz = bw.leftHand && bw.chest ? bw.leftHand.z - bw.chest.z : null;
+      const punchOx = bw.rightHand && bw.rightShoulder ? bw.rightHand.x - bw.rightShoulder.x : null;
+      // 閾値根拠(expectations.md参照): 手較正なし・手動較正(U=0.27,F=0.25)下での実測(3回連続実行、
+      // 分散ほぼ0=完全収束後の静的ポーズ)は punchDz=+0.3784, punchOx=-0.1046。
+      // 前方閾値+0.30(旧+0.15から引き上げ): 実測+0.378の21%マージン下。旧+0.15は「横に伸びる」
+      // バグ値(実測-0.33前後、UIのcal=auto経路では-0.328)との差だけを見れば十分だったが、
+      // 「前方に伸びているが弱い」ような将来の劣化(半分未満の伸展)は検出できない緩さだったため引き上げた。
+      // 横方向上限0.20: 実測|−0.1046|の約2倍のマージンを持たせつつ、tポーズ(全開横方向、実測±0.519)や
+      // 旧バグ値(cal=auto UI経路で実測-0.377、本タスクで__git stash比較により確認)を確実に弾ける値。
+      const punchFwd = punchDz != null && punchDz > 0.3;
+      const punchNotSideways = punchOx != null && Math.abs(punchOx) < 0.2;
       const chamberNotFwd = chamberDz != null && chamberDz < 0.05;
       const rOk = within(result.r, 1.4, 0.1, "rel");
-      const pass = base.pass && rightElbowBack && punchFwd && chamberNotFwd && rOk;
+      const pass = base.pass && rightElbowBack && punchFwd && punchNotSideways && chamberNotFwd && rOk;
       const detail =
         `${base.detail} / right.elbowZ=${fmt(rightElbowZ)}(要>0.03) / ` +
-        `boneWorldProbe: punchDz=${fmt(punchDz)}(要>0.15) chamberDz=${fmt(chamberDz)}(要<0.05) / ` +
+        `boneWorldProbe(突き腕=rightHand,引き手=leftHand): punchDz=${fmt(punchDz)}(要>0.30) ` +
+        `punchOx=${fmt(punchOx)}(要|x|<0.20) chamberDz=${fmt(chamberDz)}(要<0.05) / ` +
         `handAnchor.left.r=${fmt(result.r)}(理論1.4, ±10%)`;
       return {
         pass,
@@ -1092,7 +1161,8 @@ const CASES = [
           "left.elbowZ": reachElbowZ(85),
           "left.wristZ": reachWristZ(85),
           "right.elbowZ": "> +0.03",
-          punchDz: "> +0.15",
+          punchDz: "> +0.30",
+          punchOx: "|x| < 0.20",
           chamberDz: "< +0.05",
           r: "1.4 ±10%",
         },
@@ -1101,10 +1171,169 @@ const CASES = [
     dryRunPreview() {
       const chamberElbowZ = U * Math.sin(deg2rad(20));
       return {
-        "left(突き).elbowZ": reachElbowZ(85).toFixed(4),
-        "left(突き).wristZ": reachWristZ(85).toFixed(4),
-        "right(引き手).elbowZ": "+" + chamberElbowZ.toFixed(4) + " (>0.03)",
-        note: "CHAMBER_UA_DEG=20°/CHAMBER_FA_DEG=50°の閉形式導出はexpectations.md参照。Phase1(手較正無し)/Phase2(手較正あり)の2段階で検証。",
+        "z1.left(突き,mediapipe13/15).elbowZ": reachElbowZ(85).toFixed(4),
+        "z1.left(突き,mediapipe13/15).wristZ": reachWristZ(85).toFixed(4),
+        "z1.right(引き手,mediapipe14/16).elbowZ": "+" + chamberElbowZ.toFixed(4) + " (>0.03)",
+        note:
+          "CHAMBER_UA_DEG=20°/CHAMBER_FA_DEG=50°の閉形式導出はexpectations.md参照。Phase1(手較正無し)/Phase2(手較正あり)の2段階で検証。" +
+          "boneWorldProbe(VRMボーン名)は突き腕=rightHand/引き手=leftHandが正(g-fix1タスクのKalidokitミラー規約修正後、実測で確定。expectations.md参照)。" +
+          "punchDz>0.30・punchOx(|rightHand.x-rightShoulder.x|)<0.20は実測(punchDz≈+0.378,punchOx≈-0.105)に対しマージンを持たせた値。",
+      };
+    },
+  },
+  {
+    // g-fix2タスク新規ケース: __simReach(85)(両腕対称・高リーチ)。new-punch-static/new-punch-ui-autocalが
+    // 「片腕のみ突く」非対称ポーズを検証するのに対し、本ケースは「両腕とも同じ高リーチ角」という
+    // 対称ポーズで、Kalidokitの回転分解が高リーチ(85°、真の突きと同じ伸展角)でも縮退しない
+    // (=片方だけ横に伸びる異常が起きない)ことを両腕分ガードする。extendDeg=85は
+    // buildPosePunchの既定extendDegと同じ角度(意図的に揃えている、突き腕1本分の幾何と
+    // 完全に同一の式)。
+    id: "new-punch-reach85",
+    desc:
+      "__setManualCal(0.27,0.25)後__simReach(85)(両腕対称・高リーチ): 左右ともhandZ-chestZが大きく正(前方)かつ" +
+      "|handX-shoulderX|が小さい(横に伸びていない)。高リーチでのKalidokit分解の縮退を検出する回帰ガード",
+    requiredHooks: ["__resetCalibration", "__setManualCal", "__simReach", "__boneWorldProbe"],
+    async run(page) {
+      // 本タスクで実測発見: resetAndCal()(__resetCalibration→__setManualCalを別々のpage.evaluateで
+      // 実行するヘルパー)の直後に__simReach(85)を別のevaluateで呼ぶと、直前のケース(new-punch-static、
+      // 突き手/引き手で強く前後が非対称なポーズで終わる)が残したstale simResultに対しrAFが割り込み、
+      // resolveSignのヒステリシス(初回決定は無条件採用)がその非対称staleポーズを見て、片側(引き手側の
+      // mediapipe添字)の符号を誤って凍結してしまうことがある(§5.1 optional-fakedepth-sign・
+      // §14.4 new-punch-staticと同種の既知の罠。本タスクで5回連続実行のうち1回、dz.left=-0.44
+      // (符号反転)というFAILを実際に再現・特定した)。reset→cal→poseを単一のpage.evaluateに
+      // まとめて原子的に実行することで回避する(製品コード=resolveSignは変更しない)。
+      await page.evaluate(
+        ({ ua, fa, deg }) => {
+          window.__resetCalibration();
+          window.__setManualCal(ua, fa);
+          window.__simReach(deg);
+        },
+        { ua: U, fa: F, deg: 85 }
+      );
+      const conv = await pollConverge(page);
+      const bw = await page.evaluate(
+        (names) => window.__boneWorldProbe(names),
+        ["leftHand", "rightHand", "leftShoulder", "rightShoulder", "chest"]
+      );
+      const dz = { left: bw.leftHand.z - bw.chest.z, right: bw.rightHand.z - bw.chest.z };
+      const ox = { left: bw.leftHand.x - bw.leftShoulder.x, right: bw.rightHand.x - bw.rightShoulder.x };
+      return { dz, ox, converged: conv.converged };
+    },
+    assert(result) {
+      // 閾値根拠(expectations.md参照): __setManualCal(0.27,0.25)下での実測(scratchpad probe5、
+      // 3回相当の再現実行で安定)は dz.left=+0.3836, dz.right=+0.3784, ox.left=+0.1046, ox.right=-0.1046。
+      // extendDeg=85はnew-punch-static/new-punch-ui-autocalの突き腕と同一の幾何式(punchDir)なので
+      // 数値もそれらのpunchDz/punchOxとほぼ一致する(自己整合性の追加確認にもなっている)。
+      const FWD_THRESH = 0.3, LAT_THRESH = 0.2;
+      const passL = result.dz.left > FWD_THRESH && Math.abs(result.ox.left) < LAT_THRESH;
+      const passR = result.dz.right > FWD_THRESH && Math.abs(result.ox.right) < LAT_THRESH;
+      const pass = passL && passR && result.converged;
+      const detail =
+        `dz left=${fmt(result.dz.left)} right=${fmt(result.dz.right)} (要 > +${FWD_THRESH}) / ` +
+        `ox left=${fmt(result.ox.left)} right=${fmt(result.ox.right)} (要 |x| < ${LAT_THRESH}) / converged=${result.converged}`;
+      return {
+        pass,
+        detail,
+        actual: result,
+        expected: { dz: { left: `> +${FWD_THRESH}`, right: `> +${FWD_THRESH}` }, ox: { left: `|x| < ${LAT_THRESH}`, right: `|x| < ${LAT_THRESH}` } },
+      };
+    },
+    dryRunPreview() {
+      return {
+        note:
+          "__simReach(85)は左右対称のためnew-punch-staticの突き腕(85°)と全く同じ式で両腕を動かす。" +
+          "実測(手動較正、scratchpad probe5): dz.left=+0.3836 dz.right=+0.3784 ox.left=+0.1046 ox.right=-0.1046。" +
+          "閾値dz>+0.3・|ox|<0.2はこれらの実測値に安全マージンを持たせた値(new-punch-staticと同じ根拠)。",
+      };
+    },
+  },
+  {
+    // g-fix2タスク新規ケース: 実際のUIボタン([data-sim="punch"])をクリックする経路(cal=auto、
+    // ユーザーが較正していない状態=実機で再現したバグと同じ経路)の恒久回帰ガード。
+    // new-punch-static/new-punch-reach85はいずれも__setManualCal()でL_ua/L_faを既知値に固定した
+    // 「理論値検証」用の経路であり、__simPunch()という非UIフックを直接呼ぶ。しかし実機で報告された
+    // バグ(「正拳突き」ボタンを押すと突き腕が真横に伸びる)はUIボタンクリック→cal=auto(自動較正)
+    // という、ユーザーが実際にたどる経路そのもので発生していた。本ケースはこの経路をそのまま再現し、
+    // 突き腕(VRMボーン名、g-fix1タスクのミラー規約修正後は"rightHand"。new-punch-staticの訂正時と
+    // 同じ根拠・実測で確定)が前方に伸びていること(handZ-chestZ>+0.25 かつ |handX-shoulderX|<0.15)を
+    // 検証する。閾値は担当タスク仕様書の指定値をそのまま使う(実測でも安全に満たされることを確認済み、
+    // 後述)。
+    //
+    // cal=auto時の引き手(チャンバー)側の不安定性は既知の別課題(expectations.md該当節、g-fix2タスク
+    // §「cal=auto残留課題」参照)であり、本ケースの主目的(突き腕の横伸びバグの再発防止)とは無関係。
+    // 引き手側は「有界(NaN/発散なし)」のみを確認し、方向性(前/後)は判定基準に含めない。
+    id: "new-punch-ui-autocal",
+    desc:
+      "ページ読込直後に[data-sim=\"punch\"]をUIクリック(cal=auto、ユーザーと同じ経路): " +
+      "突き腕(VRMボーン名rightHand)のhandZ-chestZ>+0.25かつ|handX-shoulderX|<0.15。" +
+      "引き手(leftHand)は有界(NaN/発散なし)のみ確認。実機バグの主回帰ガード",
+    requiredHooks: ["__boneWorldProbe", "__resetCalibration", "__zProbe"],
+    async run(page) {
+      // __resetCalibration/__setManualCalを新規ページ上では一切呼ばない(このケースの主旨=cal=autoの
+      // まま検証するため)。ページは他ケースの状態を引き継がないよう、このケース専用に新規タブで開く
+      // (resetAndCal()を挟まない=較正状態が前ケースからのcalStatus="manual"等を引き継いでいないことを
+      // 保証する必要があるため、他ケースのようにpageを再利用しない)。
+      // 注意: avatar-depth.htmlはページ読込時にlocalStorage(CAL_KEY)から前回較正値を復元する仕様
+      // (同一オリジン=同一ブラウザcontext内で共有される)。他ケース(new-calibration-*等)が手動較正を
+      // 完了させるとlocalStorageに書き込まれるため、本ケースを実行順序に依存せず自己完結にするために、
+      // 新規タブを開く前に(既存pageから、同一オリジンの)localStorageを明示的に空にしておく
+      // (__resetCalibration()はこの副作用も持つが、それを新規ページ上で呼ぶのではなく、まだ何も
+      // ポーズを流していない旧ページ上で事前に呼ぶことで、新規ページの初回ロード時点から
+      // 真に「一度も較正していない」状態を保証する)。
+      await evalHook(page, "__resetCalibration", []);
+      const freshPage = await page.context().newPage();
+      freshPage.on("pageerror", (err) => console.error("[page error]", err.message));
+      await freshPage.goto(page.url());
+      await freshPage.waitForFunction(() => window.__vrmReady === true, null, { timeout: 30000 });
+      const calBefore = await freshPage.evaluate(() => window.__zProbe().cal);
+      await freshPage.click('[data-sim="punch"]');
+      // 静的ポーズだが、cal=auto下の自動較正(updateBoneCalibration)自体が収束するまで数百ms要するため、
+      // pollConverge一本ではなく固定4秒待つ(cal=autoは__zProbeのcal.L_ua/faも変化し続けるため、
+      // pollConverge(z値のみ監視)だけでは「まだ較正が変化し続けている」フレームを収束済みと誤判定しうる)。
+      await sleep(4000);
+      const bw = await freshPage.evaluate(
+        (names) => window.__boneWorldProbe(names),
+        ["leftHand", "rightHand", "leftShoulder", "rightShoulder", "chest"]
+      );
+      const calAfter = await freshPage.evaluate(() => window.__zProbe().cal);
+      await freshPage.close();
+      return { bw, calBefore, calAfter };
+    },
+    assert(result) {
+      const bw = result.bw || {};
+      const punchDz = bw.rightHand && bw.chest ? bw.rightHand.z - bw.chest.z : null;
+      const punchOx = bw.rightHand && bw.rightShoulder ? bw.rightHand.x - bw.rightShoulder.x : null;
+      const chamberFinite =
+        bw.leftHand != null &&
+        [bw.leftHand.x, bw.leftHand.y, bw.leftHand.z].every((v) => Number.isFinite(v));
+      const chamberDz = bw.leftHand && bw.chest ? bw.leftHand.z - bw.chest.z : null;
+      // 引き手は既知の不安定課題(expectations.md参照)のため方向性は問わないが、NaN/発散(体長の
+      // 数倍に飛ぶ等)だけは弾く。(U+F)*3=1.56mは安全側に十分広い上限。
+      const chamberBounded = chamberDz != null && Math.abs(chamberDz) < (U + F) * 3;
+      // 閾値根拠(expectations.md参照): 実測(scratchpad probe4、5回連続のフレッシュページロードで
+      // 再現、いずれも同一値): punchDz=+0.3785(分散<0.0001)、punchOx=-0.1086(分散<0.0001)。
+      const punchFwd = punchDz != null && punchDz > 0.25;
+      const punchNotSideways = punchOx != null && Math.abs(punchOx) < 0.15;
+      const pass = punchFwd && punchNotSideways && chamberFinite && chamberBounded;
+      const detail =
+        `突き腕(rightHand): punchDz=${fmt(punchDz)}(要>0.25) punchOx=${fmt(punchOx)}(要|x|<0.15) / ` +
+        `引き手(leftHand): dz=${fmt(chamberDz)}(有界のみ確認, finite=${chamberFinite}) / ` +
+        `cal: before=${JSON.stringify(result.calBefore)} after=${JSON.stringify(result.calAfter)}`;
+      return {
+        pass,
+        detail,
+        actual: { punchDz, punchOx, chamberDz, chamberFinite },
+        expected: { punchDz: "> +0.25", punchOx: "|x| < 0.15", chamberDz: "finite, bounded" },
+      };
+    },
+    dryRunPreview() {
+      return {
+        note:
+          "実際の[data-sim=\"punch\"]ボタン(cal=auto、__setManualCalを一切呼ばない)経路を再現する。" +
+          "実測(scratchpad probe4、5回のフレッシュページロードで再現性確認): punchDz≈+0.3785 " +
+          "punchOx≈-0.1086(いずれも分散ほぼ0)。修正前(git stashでg-fix1タスクの修正を外した状態)の" +
+          "同じ経路での実測はpunchOx=-0.3774(横方向上限0.15を明確に超える、実機バグの再現)だった" +
+          "ことも確認済み(本タスクの調査記録)。",
       };
     },
   },

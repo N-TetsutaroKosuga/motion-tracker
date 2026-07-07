@@ -215,6 +215,7 @@
         <button class="btn-ghost" data-sim="punchcycle">正拳突き（連続）</button>
         <button class="btn-ghost" data-sim="">解除</button>
       </div>
+      <div class="note" style="margin-top:6px">正拳突きの引き手（構え側の腕）は未キャリブレーション状態だと安定しにくいことがあります。事前にキャリブレーションすると改善します。</div>
     </div>
 
     <div class="note">ドラッグで回転・ホイールでズーム。全身が映る距離で立つと脚まで安定します。</div>
@@ -358,6 +359,14 @@
     ARM_SLERP_MIN: 0.25,
     SAG_DEADZONE: 0.14,      // 矢状角の不感帯[rad]
     SAG_MAX_RATE: 0.25,      // 矢状角のフレームあたり最大変化量[rad]
+    // armSagittalの特異点ガード閾値[m](メカニズムC対策、ハイブリッド方式のみ有効)。肩→肘の
+    // outward(横)・forward(奥行き)のhypotがこれ未満なら「両方検出限界以下=atan2が数値的に不安定」
+    // と判断し、その姿勢由来の新しい矢状角を注入せず直近の確定角を保持する。引き手(チャンバー)は
+    // outward=0(設計上肩肘のxオフセットが厳密に0)かつ、ハイブリッドZの自動較正が引き手ポーズ自身
+    // からしか骨長を採取できない自己参照性でforward(zMag)も0にクランプされるため、実測値は常に
+    // 厳密に0.000(丸め誤差のみ)になる。2cmは通常の腕の動き(cm〜dm単位)より一桁以上小さく、
+    // 誤検出(本当に動いている腕をガードで凍結してしまう)のリスクは低い。
+    SAG_SINGULARITY_EPS: 0.02,
     // 前後(z)確認UI(g1タスク)の判定閾値[m]。手ボーンのworld zが胸(chest)よりこの値を超えて
     // +側(前方/カメラ寄り)なら「前」、-側なら「後」、それ未満なら「中立」とみなす。
     // 0.05mはCONTRACT.mdの目安値どおり。__setFrontBackThreshで変更可能。
@@ -371,6 +380,7 @@
   window.__setFallbackThresh = (v) => { HZ.FALLBACK_THRESH = v; };
   window.__setFlipGate = (v) => { HZ.FLIP_ZMAG_THRESH = v; };
   window.__setSagLimits = (deadzone, maxRate) => { HZ.SAG_DEADZONE = deadzone; HZ.SAG_MAX_RATE = maxRate; };
+  window.__setSagSingularityEps = (v) => { HZ.SAG_SINGULARITY_EPS = v; };
   window.__setFrontBackThresh = (v) => { HZ.FRONTBACK_THRESH = v; };
   // ヘッドレス検証用: visibilityゲートのヒステリシス閾値(enter/exit)を実行時調整する。
   // 引数省略(null/undefined)の側は変更しない。
@@ -1457,23 +1467,54 @@
     return { left: side(11, 13, 15), right: side(12, 14, 16) };
   };
 
-  // 上腕の前後(矢状面)角を world座標から計算。0=横(T), +=前(カメラ方向), −=後ろ
-  function armSagittal(w, sIdx, eIdx, leftSide) {
+  // 上腕の前後(矢状面)角を world座標から計算。0=横(T), +=前(カメラ方向), −=後ろ。
+  // magは outward/forward の大きさ(hypot)も返す: 引き手(チャンバー)のように肩→肘のx(横)オフセットも
+  // z(奥行き)オフセットも両方ほぼ0になる姿勢では、ハイブリッドZの自動較正が同じ姿勢自身から骨長を
+  // 採取する自己参照性によりzMag(肘)が0にクランプされ、outward・forwardが真の(0,0)特異点に落ち込む
+  // (実測: atan2(≈0,≈0)が符号付きゼロの丸め誤差だけで0°/±180°を毎フレーム往復する)。
+  // フォールバック(g-fix1タスク、メカニズムC対策): 肩→肘が特異点(mag<eps)のときは肩→手首(wIdx、
+  // 前腕まで含む)のoutward/forwardで再試行する。実測(__zProbe): 引き手姿勢では自動較正が上腕長
+  // L_uaのみ引き手ポーズ自身の2D投影長へ収束し zMag(肘)=0 に張り付くが、前腕長L_faは同時に
+  // 自己参照する保証がなく(実測 L_fa=0.200 vs 引き手前腕2D投影長lW≈0.161、zMag(手首)=0.119>0)、
+  // 手首側にはまだ有効な前後情報が残っている。outwardは引き手のように上腕・前腕どちらもx(横)
+  // オフセット0で設計された矢状面内の姿勢では、肘基準でも手首基準でも同じ値(0)になるため、
+  // 基準点を切り替えても矛盾しない。両方特異点(手首もmag<eps)の場合のみ、呼び出し側
+  // (updateSagAngle)がmagで検出し新しい角度を注入せず直近の確定角を保持する。legacy方式
+  // (sagGateOnのelse分岐)はmagを見ないため既存動作を変えない。
+  function armSagittal(w, sIdx, eIdx, wIdx, leftSide) {
     const s = w[sIdx], e = w[eIdx];
-    if (!s || !e) return 0;
+    if (!s || !e) return { angle: 0, mag: Infinity };
     const vx = e.x - s.x, vz = e.z - s.z;
     const outward = leftSide ? vx : -vx;
     const forward = -vz; // MediaPipe world: -z がカメラ手前
-    return Math.atan2(forward, outward);
+    const mag = Math.hypot(outward, forward);
+    if (mag >= HZ.SAG_SINGULARITY_EPS || !w[wIdx]) return { angle: Math.atan2(forward, outward), mag };
+    const wr = w[wIdx];
+    const vxW = wr.x - s.x, vzW = wr.z - s.z;
+    const outwardW = leftSide ? vxW : -vxW;
+    const forwardW = -vzW;
+    const magW = Math.hypot(outwardW, forwardW);
+    if (magW >= HZ.SAG_SINGULARITY_EPS) return { angle: Math.atan2(forwardW, outwardW), mag: magW };
+    return { angle: Math.atan2(forward, outward), mag }; // 肘・手首とも特異点: magはeps未満のまま返し、呼び出し側でホールドさせる
+  }
+  // 角度差を最短経路((-π,π])に正規化する。メカニズムC(i)対策: ラップアラウンドが無いと
+  // 0°と-180°のような境界を跨ぐ往復が常に「大きい変化」と誤判定され、SAG_MAX_RATEのスルーレート
+  // 制限が同方向にしか働かず(実測: 6秒間 0.0→-180.0→-165.7→…と非収束)、永久に往復し続けてしまう。
+  function wrapAngleDelta(d) {
+    d = d % (2 * Math.PI);
+    if (d > Math.PI) d -= 2 * Math.PI;
+    else if (d < -Math.PI) d += 2 * Math.PI;
+    return d;
   }
   // 矢状角にスルーレート制限＋不感帯を適用（ハイブリッド方式のみ。従来方式はavatar.html同等の生値を使う）
   const sagAngle = { L: 0, R: 0 };
   function updateSagAngle(side, raw) {
     const cur = sagAngle[side];
-    const delta = raw - cur;
+    if (raw == null) return cur; // メカニズムC(ii): 特異点フレーム(呼び出し側がnullを渡す)は直近の確定角を保持する
+    const delta = wrapAngleDelta(raw - cur);
     if (Math.abs(delta) < HZ.SAG_DEADZONE) return cur; // 前回確定角から近い変化は無視（ジッター抑制）
     const clamped = Math.max(-HZ.SAG_MAX_RATE, Math.min(HZ.SAG_MAX_RATE, delta));
-    sagAngle[side] = cur + clamped;
+    sagAngle[side] = wrapAngleDelta(cur + clamped); // 状態自体も(-π,π]に保つ
     return sagAngle[side];
   }
   // 腕ボーンのslerp係数を信頼度(visibility)連動にする（ハイブリッド方式のみ。低visibility時は小さく）
@@ -1609,13 +1650,28 @@
           // 実測で確認できたのはVRM0(同梱サンプル)側のみ。VRM1側(sagSgn=1=現状維持)は実機VRM1モデルが
           // 手元にないため未検証(z側の実装時と同じ前提を踏襲した推定)。想定外のVRM向けには従来どおり
           // __setSag(l, r, s)で最終的な符号・スケールを直接上書きできる(SAG_L/SAG_Rはsgn適用後に乗算される)。
+          //
+          // メカニズムA修正(g-fix1タスク): Kalidokit内部は鏡像(ミラーモード)前提でL/Rを入れ替えて
+          // 計算している(kalidokit calcArms: UpperArm.r=findRotation(lm[11],lm[13])、
+          // UpperArm.l=findRotation(lm[12],lm[14])。つまり rp.RightUpperArm のx/zはmediapipe添字
+          // 11/13由来、rp.LeftUpperArm のx/zは12/14由来)。修正前はこのミラー規約を適用せず
+          // armSagittal(...,11,13,...)をrp.LeftUpperArm.yに、(...,12,14,...)をrp.RightUpperArm.yに
+          // 書いていたため、x/zとyが別の物理腕(mediapipe添字)由来のフランケンシュタイン合成になり、
+          // 正拳突きで突き腕のx/z(Kalidokit生値)に引き手のy(不安定な矢状角)が乗る、または逆、という
+          // 実機バグ(LUAが真横に伸びる/RUAが胸前に来る)を生んでいた。x/zと同じ添字対をyにも使うよう
+          // 入れ替える。armSlerpFactor呼び出し側(rigRotation直前)も同じ理由で入れ替え済み。
           const sagSgn = isVRM0 ? -1 : 1;
-          const rawL = SAG_L * sagSgn * armSagittal(src3d, 11, 13, true) * SAG_SCALE;
-          const rawR = SAG_R * sagSgn * armSagittal(src3d, 12, 14, false) * SAG_SCALE;
+          const sagL = armSagittal(src3d, 12, 14, 16, false); // rp.LeftUpperArmのx/z(Kalidokit)と同じ12/14(+手首16でフォールバック)
+          const sagR = armSagittal(src3d, 11, 13, 15, true);  // rp.RightUpperArmのx/z(Kalidokit)と同じ11/13(+手首15でフォールバック)
+          const rawL = SAG_L * sagSgn * sagL.angle * SAG_SCALE;
+          const rawR = SAG_R * sagSgn * sagR.angle * SAG_SCALE;
           if (Z_METHOD === "hybrid") {
-            // ハイブリッドのみスルーレート制限+不感帯を適用（従来方式はavatar.htmlと同じ生値を使う）
-            if (rp.LeftUpperArm) rp.LeftUpperArm.y = updateSagAngle("L", rawL);
-            if (rp.RightUpperArm) rp.RightUpperArm.y = updateSagAngle("R", rawR);
+            // ハイブリッドのみスルーレート制限+不感帯+特異点ガードを適用（従来方式はavatar.htmlと
+            // 同じ生値を使うため、legacy(else分岐)はmagを見ずrawL/rawRをそのまま書く=既存動作を変えない）。
+            const gL = sagL.mag < HZ.SAG_SINGULARITY_EPS ? null : rawL;
+            const gR = sagR.mag < HZ.SAG_SINGULARITY_EPS ? null : rawR;
+            if (rp.LeftUpperArm) rp.LeftUpperArm.y = updateSagAngle("L", gL);
+            if (rp.RightUpperArm) rp.RightUpperArm.y = updateSagAngle("R", gR);
           } else {
             if (rp.LeftUpperArm) rp.LeftUpperArm.y = rawL;
             if (rp.RightUpperArm) rp.RightUpperArm.y = rawR;
@@ -1646,10 +1702,16 @@
         rigPosition("hips", { x: rp.Hips.position.x, y: rp.Hips.position.y + 1, z: rp.Hips.position.z }, 1, 0.07);
         rigRotation("chest", rp.Spine, 0.25);
         rigRotation("spine", rp.Spine, 0.45);
-        rigRotation("rightUpperArm", rp.RightUpperArm, 1, armSlerpFactor(12, 14, src3d));
-        rigRotation("rightLowerArm", rp.RightLowerArm, 1, armSlerpFactor(14, 16, src3d));
-        rigRotation("leftUpperArm", rp.LeftUpperArm, 1, armSlerpFactor(11, 13, src3d));
-        rigRotation("leftLowerArm", rp.LeftLowerArm, 1, armSlerpFactor(13, 15, src3d));
+        // メカニズムA修正(g-fix1タスク): Kalidokitのミラー規約(rp.RightUpperArm/RightLowerArmの回転は
+        // mediapipe添字11/13・13/15由来、rp.LeftUpperArm/LeftLowerArmは12/14・14/16由来。calcArms参照)
+        // に合わせ、visibility連動のslerp係数も回転データと同じ添字対で見るよう入れ替える。修正前は
+        // 逆の添字対のvisibilityを見ていたため、例えば突き腕(11/13)の可視性が落ちても
+        // rp.RightUpperArmのスラープ減速が働かず(引き手側12/14のvisibilityを見てしまうため)、
+        // 占有中の腕の追従性が意図どおりに落ちない不整合があった。
+        rigRotation("rightUpperArm", rp.RightUpperArm, 1, armSlerpFactor(11, 13, src3d));
+        rigRotation("rightLowerArm", rp.RightLowerArm, 1, armSlerpFactor(13, 15, src3d));
+        rigRotation("leftUpperArm", rp.LeftUpperArm, 1, armSlerpFactor(12, 14, src3d));
+        rigRotation("leftLowerArm", rp.LeftLowerArm, 1, armSlerpFactor(14, 16, src3d));
         rigRotation("rightUpperLeg", rp.RightUpperLeg);
         rigRotation("rightLowerLeg", rp.RightLowerLeg);
         rigRotation("leftUpperLeg", rp.LeftUpperLeg);
