@@ -335,6 +335,14 @@
     SIGN_HI: 0.12, SIGN_LO: -0.12, // 深度ベース符号判定のシュミット閾値（refSpreadに対する相対比。predicted_depthは絶対スケール不定のため相対値にしている）
     FALLBACK_THRESH: 0.03,   // フォールバック(生z、単位:m)符号判定の閾値
     FLIP_ZMAG_THRESH: 0.05,  // zMag[m]がこれ未満(=体側平面通過付近)のときのみ符号反転を許可
+    // D1調査(resolveSignの符号固着)対策: 矢状面内(x≈0)の往復では2D投影長がU/Fの全長付近まで
+    // 伸びる瞬間が実質発生せず(zMagが常に大きいまま)、上のFLIP_ZMAG_THRESHゲートが開かない。
+    // 「zMagが小さい」以外にもう1つ、独立したフリップ許可経路を追加する: 生z比較(score)が
+    // 閾値をSIGN_OVERRIDE_MULT倍以上(=誤検出に強い、明確な逆符号)上回る状態がSIGN_OVERRIDE_MS
+    // 継続したら反転を許可する。中間帯の1〜2フレームだけの揺れでは閾値超過そのものか継続時間の
+    // どちらかで弾かれる設計(実測: punch.y4mでの検証はscratchpadのD1調査ノート参照)。
+    SIGN_OVERRIDE_MS: 200,
+    SIGN_OVERRIDE_MULT: 1.5,
     REF_EMA_TAU: 1.0,        // スケール/シフト整合の参照点EMA時定数[s]
     REF_VIS_MIN: 0.5,        // スケール/シフト整合の参照点に使う最低visibility
     // 腕ランドマークzゲート：ヒステリシス化(f1タスク)。旧仕様は VIS_GATE_MIN 単一閾値で
@@ -371,6 +379,16 @@
     // +側(前方/カメラ寄り)なら「前」、-側なら「後」、それ未満なら「中立」とみなす。
     // 0.05mはCONTRACT.mdの目安値どおり。__setFrontBackThreshで変更可能。
     FRONTBACK_THRESH: 0.05,
+    // D3対策(B案): 高リーチ域でfused world 3Dベクトルから直接ボーン回転を構成しKalidokit値と
+    // ρブレンドする。ρ(0〜1)は「|fused zの区間差|/骨長」をREACH_BLEND_LO〜HIでsmoothstepした値。
+    // 低リーチ(ρ=0)は完全にKalidokit生値(=既存動作)のまま、高リーチほど直接ベクトル方向を採用する。
+    // 0.6/0.85だと正拳突きの引き手(チャンバー)姿勢(CHAMBER_UA_DEG=40°→sin(40°)=0.643、
+    // CHAMBER_FA_DEG=50°→sin(50°)=0.766)がしきい値をわずかに超えてしまい、突いていない側の
+    // 手が意図せず前方へブレンドされる回帰(new-punch-static のchamberDz)が実測で確認できたため、
+    // チャンバー比(前腕側0.766が最大)に対し余裕を持たせた0.8/0.92に調整した(§d3int_*.mjsで実測確認済み)。
+    REACH_BLEND_LO: 0.8,
+    REACH_BLEND_HI: 0.92,
+    REACH_BLEND_TAU: 0.15,  // ρ自体のexpLerp時定数[s](閾値付近のちらつき防止)
   };
   window.__setOneEuro = (mincutoff, beta) => {
     ONE_EURO_MINCUTOFF = mincutoff; ONE_EURO_BETA = beta;
@@ -379,9 +397,11 @@
   window.__setSignThresh = (hi, lo) => { HZ.SIGN_HI = hi; HZ.SIGN_LO = lo; };
   window.__setFallbackThresh = (v) => { HZ.FALLBACK_THRESH = v; };
   window.__setFlipGate = (v) => { HZ.FLIP_ZMAG_THRESH = v; };
+  window.__setSignOverride = (ms, mult) => { if (ms != null) HZ.SIGN_OVERRIDE_MS = ms; if (mult != null) HZ.SIGN_OVERRIDE_MULT = mult; };
   window.__setSagLimits = (deadzone, maxRate) => { HZ.SAG_DEADZONE = deadzone; HZ.SAG_MAX_RATE = maxRate; };
   window.__setSagSingularityEps = (v) => { HZ.SAG_SINGULARITY_EPS = v; };
   window.__setFrontBackThresh = (v) => { HZ.FRONTBACK_THRESH = v; };
+  window.__setReachBlend = (lo, hi) => { if (lo != null) HZ.REACH_BLEND_LO = lo; if (hi != null) HZ.REACH_BLEND_HI = hi; };
   // ヘッドレス検証用: visibilityゲートのヒステリシス閾値(enter/exit)を実行時調整する。
   // 引数省略(null/undefined)の側は変更しない。
   window.__setVisGate = (enterMin, exitMin) => {
@@ -458,12 +478,18 @@
   // ---- ハイブリッドZ: 実行時状態 ----
   const shoulderZRef = {};   // idx(11,12) -> 低域通過済み基準z
   const rawZLP = {};         // idx(11-16) -> 生world zの低域通過（フォールバック用）
-  const signState = { 13: { sign: 1, init: false }, 14: { sign: 1, init: false }, 15: { sign: 1, init: false }, 16: { sign: 1, init: false } };
+  const signState = {
+    13: { sign: 1, init: false, mismatchMs: 0, mismatchSign: null },
+    14: { sign: 1, init: false, mismatchMs: 0, mismatchSign: null },
+    15: { sign: 1, init: false, mismatchMs: 0, mismatchSign: null },
+    16: { sign: 1, init: false, mismatchMs: 0, mismatchSign: null },
+  };
   const lastFusedZ = {};     // idx(11-16) -> 直近の出力z（visibilityゲート保持・One Euro適用後）
   const refEma = {};         // idx(0,11,12,23,24) -> スケール/シフト整合済み値のスローEMA
   let scaleFit = { a: 1, b: 0, initialized: false };
   let visUnavailableSince = null, visGateDisabled = false;
   let lastFuseT = null;
+  let lastFuseDt = 1 / 60; // D3対策(B案)のρヒステリシスがfuseArmZHybridと同じdtを再利用するための共有値
   let latestDepthRaw = null;       // out.predicted_depth を軽量化した {H,W,data}
   let latestDepthSampleLm2 = null; // レイテンシ補償: 深度推論開始時刻に最も近い2D座標スナップショット
   let lastFusedWorld = null;       // __zProbe 用に直近の融合済みworldを保持
@@ -595,6 +621,7 @@
         scene.add(vrm.scene);
         currentVrm = vrm;
         isVRM0 = !!(vrm.meta && String(vrm.meta.metaVersion) === "0");
+        captureRestDirs(); // D3対策(B案): このモデルのバインドポーズ腕方向をキャッシュ
         window.__vrmReady = true; // ヘッドレス検証用：VRM読込完了フラグ
         if (revoke) URL.revokeObjectURL(url);
         setStatus("hide");
@@ -618,6 +645,77 @@
     if (!node) return;
     const e = new THREE.Euler((rot.x || 0) * dampener, (rot.y || 0) * dampener, (rot.z || 0) * dampener, rot.rotationOrder || "XYZ");
     node.quaternion.slerp(new THREE.Quaternion().setFromEuler(e), l);
+  }
+  // D3対策(B案、Kalidokit反映の縮退): 高リーチ域でrp.*(Kalidokit生Euler)の代わりに、または
+  // ブレンドしたクォータニオンを直接適用する。quatが非nullならそれを、nullならeulerFallback
+  // (通常のKalidokit rp.*)をそのままEuler経由で適用する(=既存rigRotationと同じ挙動、後方互換)。
+  function rigRotationQuat(name, quat, eulerFallback, l = SMOOTH) {
+    if (!currentVrm) return;
+    const node = currentVrm.humanoid.getNormalizedBoneNode(name);
+    if (!node) return;
+    let target = quat;
+    if (!target) {
+      if (!eulerFallback) return;
+      target = new THREE.Quaternion().setFromEuler(new THREE.Euler(eulerFallback.x || 0, eulerFallback.y || 0, eulerFallback.z || 0, eulerFallback.rotationOrder || "XYZ"));
+    }
+    node.quaternion.slerp(target, l);
+  }
+  // D3対策(B案): 各腕ボーンの「バインドポーズでのローカルrest方向」。three-vrmの正規化ボーンでは
+  // 子ボーンのposition(親からのオフセット)は自身のquaternionに一切影響されない固定値なので、
+  // 一度でも読めば以後ずっと有効(VRM読込後の任意タイミングで再計算しても同じ値になる)。
+  // ハードコードの(1,0,0)ではなくモデルから実測することで、VRM0/VRM1やモデル間のボーン軸差を吸収する。
+  let restDirUA = { left: null, right: null }, restDirFA = { left: null, right: null };
+  function captureRestDirs() {
+    if (!currentVrm || !currentVrm.humanoid) return;
+    for (const vs of ["left", "right"]) {
+      const ua = currentVrm.humanoid.getNormalizedBoneNode(vs + "UpperArm");
+      const la = currentVrm.humanoid.getNormalizedBoneNode(vs + "LowerArm");
+      const hand = currentVrm.humanoid.getNormalizedBoneNode(vs + "Hand");
+      restDirUA[vs] = (ua && la && la.position.lengthSq() > 1e-10) ? la.position.clone().normalize() : null;
+      restDirFA[vs] = (la && hand && hand.position.lengthSq() > 1e-10) ? hand.position.clone().normalize() : null;
+    }
+  }
+  // D3対策(B案): リーチ度ρ(0〜1)をHZ.REACH_BLEND_LO/HIのsmoothstep+expLerpヒステリシスで求める。
+  const reachRatioState = { left: { ua: 0, fa: 0 }, right: { ua: 0, fa: 0 } };
+  // ヘッドレス検証用(読み取り専用、判定ロジックには不関与): 直近フレームのρ・ブレンド適用有無。
+  const b3DebugState = { left: { ua: { rho: 0, blended: false }, fa: { rho: 0, blended: false } }, right: { ua: { rho: 0, blended: false }, fa: { rho: 0, blended: false } } };
+  function updateReachRatio(side, key, raw, dt) {
+    const target = smoothstep(raw, HZ.REACH_BLEND_LO, HZ.REACH_BLEND_HI);
+    const next = expLerp(reachRatioState[side][key], target, dt, HZ.REACH_BLEND_TAU);
+    reachRatioState[side][key] = next;
+    return next;
+  }
+  // D3対策(B案): fusedのworld位置(mediapipe座標)から直接ボーン回転を構成する。parentNodeの現在の
+  // ワールド回転(既にこのフレームで確定済みの親ボーン回転を反映)を使って、fused方向ベクトルを
+  // 親ローカル系に変換し、restDirLocal(バインドポーズ方向)からのクォータニオンを作る。
+  //
+  // 軸マッピング(実測で確定・仮説ではない): mediapipeのworld座標系をTHREE.js側のワールド方向として
+  // そのまま使うと符号が合わない(実測: X/Y/Zの3軸すべてで反転が必要)。具体的には以下3つの独立した
+  // ヘッドレス実測(いずれもscratchpad d3int_*.mjs、本パッチ確定前に実施)で1軸ずつ検証済み:
+  //   - Z: __simReach(85)でboneWorldProbeのrightHand.z-chest.z(既存の「背中方向リーチ」回帰の指標、
+  //     >0=前方)をflip前後で比較。mediapipe生Zをそのまま使うと-0.47(後方=誤)、反転すると+0.40
+  //     (前方=正、無改造時の基準+0.38とほぼ一致)。
+  //   - Y: __simReach3D(90,±40,"left")(仰角のみ逆で他は同一)でrightHand.yを比較。反転しない場合は
+  //     仰角+40(上)の方が仰角-40(下)よりhand.yが低くなる(物理的に逆転)。反転すると+40の方が
+  //     高くなる(正しい上下関係)。
+  //   - X: __setReachBlend(-0.1,-0.05)でρ=1を強制した状態でTポーズ(__simReach(0))を評価し、
+  //     armProbe().right.xがB3無効時のTポーズ基準値(-1)と一致するか比較。反転しない場合は+1
+  //     (符号が反転=誤)、反転すると-1(基準と一致=正)。
+  // これは`VRMUtils.rotateVRM0`がVRM0モデルをシーン内で180°回転させる際の座標変換と、mediapipeの
+  // ワールド座標系がTHREE.jsと逆手系である可能性の複合効果とみられる(理論的な導出は未完了、実測のみで
+  // 確定)。isVRM0(既存コードの`sgn`/`sagSgn`と同じ変数)でVRM0/VRM1を切り替える。VRM1は実機モデルが
+  // 手元になく未検証(この点は同梱の矢状角パッチのVRM1側と同じ既知の限界)。
+  const __tmpQ = new THREE.Quaternion(), __tmpV = new THREE.Vector3();
+  function directBoneQuat(parentNode, childPos, parentPos, restDirLocal) {
+    if (!parentNode || !restDirLocal || !childPos || !parentPos) return null;
+    const b3Flip = isVRM0 ? -1 : 1;
+    const dx = (childPos.x - parentPos.x) * b3Flip, dy = (childPos.y - parentPos.y) * b3Flip, dz = (childPos.z - parentPos.z) * b3Flip;
+    const lenSq = dx * dx + dy * dy + dz * dz;
+    if (!(lenSq > 1e-10)) return null;
+    parentNode.updateWorldMatrix(true, false);
+    const invParentWorldQ = parentNode.getWorldQuaternion(__tmpQ).invert();
+    __tmpV.set(dx, dy, dz).normalize().applyQuaternion(invParentWorldQ);
+    return new THREE.Quaternion().setFromUnitVectors(restDirLocal, __tmpV);
   }
   function rigPosition(name, pos, dampener = 1, l = SMOOTH) {
     if (!currentVrm || !pos) return;
@@ -1110,7 +1208,10 @@
   // 手サイズのランニング中央値を蓄積（骨長自動較正と同じ「サンプル配列+中央値」パターン）。
   // 明示較正済みならここでは更新しない。
   function updateHandAutoCalSide(side, hand, rho, aspect) {
-    if (handCalStatus === "manual") return;
+    // D2調査対策: 「manual」ロックは、この側で実際に手サイズ基準が採れている場合だけ有効にする。
+    // 手動較正が完走しても、その回で手が検出/マッチされずd09_0/d517_0が空(null)のままだと
+    // 以後永久にこの側の自動学習フォールバックが機能しなくなる(実機で観測: match=○でもr=?,w=0.00固定)。
+    if (handCalStatus === "manual" && (handCal.d09_0[side] > 0 || handCal.d517_0[side] > 0)) return;
     if (!(rho < HA.CAL_RHO_MAX)) return;
     const m = handSizeMetrics(hand, aspect);
     if (!m) return;
@@ -1122,7 +1223,8 @@
     if (md517) { handCal.d517_0[side] = md517; if (handCalStatus === "default") handCalStatus = "auto"; }
   }
   function updateHandAutoCalShoulder(world, lm2, aspect, anyRhoLow) {
-    if (handCalStatus === "manual" || !anyRhoLow) return;
+    // D2調査対策: 同様に、W_m/w_nが実際に採れている場合だけ"manual"ロックを効かせる。
+    if ((handCalStatus === "manual" && handCal.W_m > 0 && handCal.w_n > 0) || !anyRhoLow) return;
     const wn = shoulderWidth2D(lm2, aspect);
     const wm = seg3DLenXY(world, 11, 12);
     if (wn == null || wm == null || wm <= 0) return;
@@ -1280,26 +1382,57 @@
   // 比較参照は常に SEG_PARENT[idx]（肘なら肩、手首なら肘）＝チェーン式 wristZ = elbowZ − sign*zMag が
   // 要求する「直近の親関節との前後関係」に合わせる。肩は安定参照点としてrefEmaのスローEMA値を使うが、
   // 肘にはrefEma相当が無いため、肘自身の整合済み深度をその場でサンプルして使う。
-  function resolveSign(idx, zMag) {
+  function resolveSign(idx, zMag, dt, vis) {
     const st = signState[idx];
     const refIdx = SEG_PARENT[idx]; // 肘(13/14)なら肩(11/12)、手首(15/16)なら肘(13/14)
     const refIsShoulder = refIdx === 11 || refIdx === 12;
-    let proposed = null;
+    let proposed = null, mode = null, score = null;
     if (depthAvailable() && latestDepthSampleLm2) {
       const dAligned = sampleArmPointDepthAligned(idx, latestDepthSampleLm2);
       const rRef = refIsShoulder ? refEma[refIdx] : sampleArmPointDepthAligned(refIdx, latestDepthSampleLm2);
       if (dAligned != null && rRef != null) {
-        const score = (dAligned - rRef) / refSpread(); // +: 対象点が参照点より手前(前)
+        score = (dAligned - rRef) / refSpread(); // +: 対象点が参照点より手前(前)
+        mode = "depth";
         if (score > HZ.SIGN_HI) proposed = 1; else if (score < HZ.SIGN_LO) proposed = -1;
       }
     } else if (rawZLP[idx] != null && rawZLP[refIdx] != null) {
-      const score = rawZLP[refIdx] - rawZLP[idx]; // MediaPipe規約:-z=手前 → 参照点より小さいz=前
+      score = rawZLP[refIdx] - rawZLP[idx]; // MediaPipe規約:-z=手前 → 参照点より小さいz=前
+      mode = "fallback";
       if (score > HZ.FALLBACK_THRESH) proposed = 1; else if (score < -HZ.FALLBACK_THRESH) proposed = -1;
     }
     if (!st.init) { if (proposed != null) st.sign = proposed; st.init = true; return st.sign; }
-    // フリップは腕が体側平面を通過する瞬間(zMagが小さい)だけ許可。それ以外は中間帯と同じく前回符号を保持。
-    if (proposed != null && proposed !== st.sign && zMag < HZ.FLIP_ZMAG_THRESH) {
+    const mismatched = proposed != null && proposed !== st.sign;
+    // D1調査対策: もう1つのフリップ許可経路（下のzMagゲートと独立・OR条件）。
+    // 生z比較(score)が閾値をSIGN_OVERRIDE_MULT倍以上、明確に逆符号側で上回る状態が
+    // SIGN_OVERRIDE_MS継続したら、zMagが体側平面付近まで小さくなっていなくても反転を許可する。
+    // 矢状面内の往復(punch等)ではzMagが常に大きいままフリップの出番が来ないケースを救済する。
+    //
+    // QCレビュー対策(独立検証で発見): 上のzMagゲートはgatedFuseWriteの出力側ヒステリシス
+    // (visが下がったら出力を凍結)が実質的にノイズ源を遮断してくれるのに対し、この新しい
+    // persistence経路にはそれが無く、resolveSign自体がvisを一切見ていなかったため、
+    // 低visibility(オクルージョン中)に生z/深度スコアが一方向へ偏ったまま200ms以上続くと、
+    // 出力は凍結されたまま(見た目は正常)でもsignState/mismatchMsだけが裏で反転してしまい、
+    // visが回復した瞬間に凍結が解けて突然逆符号の値へ「ポップ」する実測を確認した(vis=0.3固定+
+    // フェイク深度で反転を誘発→vis=1.0に戻した瞬間にwristZが-0.50→-0.04へ飛ぶ再現に成功。
+    // 同じ手順をこのパッチ適用前のHEADで実行すると一切反転しないことも確認済み＝新規リスク)。
+    // 対策: strongMismatchはvisがVIS_GATE_MIN以上(=gatedFuseWriteが出力を凍結しない条件)の
+    // フレームでしか成立しない(=低vis中はmismatchMsが0にリセットされ続け、蓄積が進まない)。
+    const visOkForOverride = vis == null || vis >= HZ.VIS_GATE_MIN;
+    const overrideThresh = (mode === "depth" ? HZ.SIGN_HI : HZ.FALLBACK_THRESH) * HZ.SIGN_OVERRIDE_MULT;
+    const strongMismatch = mismatched && score != null && Math.abs(score) > overrideThresh && visOkForOverride;
+    if (strongMismatch && st.mismatchSign === proposed) {
+      st.mismatchMs = (st.mismatchMs || 0) + Math.max(0, dt || 0) * 1000;
+    } else {
+      st.mismatchMs = 0;
+    }
+    st.mismatchSign = mismatched ? proposed : null;
+    // フリップは(a)腕が体側平面を通過する瞬間(zMagが小さい)、または(b)強く・持続的に逆符号を
+    // 示す生z証拠がある、のいずれかの場合のみ許可。それ以外は中間帯と同じく前回符号を保持。
+    const flipByZMag = mismatched && zMag < HZ.FLIP_ZMAG_THRESH;
+    const flipByPersistence = strongMismatch && st.mismatchMs >= HZ.SIGN_OVERRIDE_MS;
+    if (flipByZMag || flipByPersistence) {
       st.sign = proposed;
+      st.mismatchMs = 0; st.mismatchSign = null;
       gateDebugCounters.signFlips[idx] = (gateDebugCounters.signFlips[idx] || 0) + 1; // 評価用カウンタ(判定ロジックには不関与)
     }
     return st.sign;
@@ -1361,6 +1494,7 @@
     if (!world[11] || !world[12] || !world[13] || !world[14] || !world[15] || !world[16]) return;
     const dt = lastFuseT == null ? 1 / 60 : clampDt((now - lastFuseT) / 1000);
     lastFuseT = now;
+    lastFuseDt = dt;
 
     updateVisibilityWatchdog(world, now);
     updateBoneCalibration(world, lm2);
@@ -1400,11 +1534,11 @@
 
       const { lE, lW, rho } = geom[wrist];
       const zMagE = lE >= L_ua ? 0 : Math.sqrt(Math.max(0, L_ua * L_ua - lE * lE));
-      const signE = resolveSign(elbow, zMagE);
+      const signE = resolveSign(elbow, zMagE, dt, world[elbow] ? world[elbow].visibility : null);
       const elbowZChain = shoulderZRef[shoulder] - signE * zMagE;
 
       const zMagW = lW >= L_fa ? 0 : Math.sqrt(Math.max(0, L_fa * L_fa - lW * lW));
-      const signW = resolveSign(wrist, zMagW);
+      const signW = resolveSign(wrist, zMagW, dt, world[wrist] ? world[wrist].visibility : null);
       const wristZChain = elbowZChain - signW * zMagW;
 
       let elbowX = world[elbow].x, elbowY = world[elbow].y, elbowZ = elbowZChain, wristZ = wristZChain;
@@ -1560,13 +1694,19 @@
     clearObj(visGateState); // visibilityゲートのヒステリシス状態（凍結中フラグ）
     clearObj(gateDebugCounters.gateFlips); clearObj(gateDebugCounters.signFlips); // 評価用カウンタ
     clearObj(depthEma); // legacy z方式のEMA状態（ハイブリッド既定では未使用だが念のため）
-    for (const idx of [13, 14, 15, 16]) { signState[idx].sign = 1; signState[idx].init = false; }
+    for (const idx of [13, 14, 15, 16]) { signState[idx].sign = 1; signState[idx].init = false; signState[idx].mismatchMs = 0; signState[idx].mismatchSign = null; }
     scaleFit = { a: 1, b: 0, initialized: false };
     visUnavailableSince = null; visGateDisabled = false;
     lastFuseT = null;
     lastFusedWorld = null;
     poseRing.length = 0;
     sagAngle.L = 0; sagAngle.R = 0;
+    // D3対策(B案): リーチ度ρの状態もリセット(前回テスト/セッションの残留を防ぐ)
+    for (const vs of ["left", "right"]) {
+      reachRatioState[vs].ua = 0; reachRatioState[vs].fa = 0;
+      b3DebugState[vs].ua = { rho: 0, blended: false }; b3DebugState[vs].fa = { rho: 0, blended: false };
+    }
+    lastFuseDt = 1 / 60;
     // 手アンカー：スイベル・ブレンド重み・手首回転強度・直近有効値・直近マッチ
     for (const side of [15, 16]) { HA_DBG[side] = { w: 0, r: null, dz: null, elbowDeg: null, matched: false }; wristRotBlend[side] = 0; swivelState[side] = null; lastValidAnchor[side] = null; }
     lastHandMatch = { 15: null, 16: null };
@@ -1708,10 +1848,58 @@
         // 逆の添字対のvisibilityを見ていたため、例えば突き腕(11/13)の可視性が落ちても
         // rp.RightUpperArmのスラープ減速が働かず(引き手側12/14のvisibilityを見てしまうため)、
         // 占有中の腕の追従性が意図どおりに落ちない不整合があった。
-        rigRotation("rightUpperArm", rp.RightUpperArm, 1, armSlerpFactor(11, 13, src3d));
-        rigRotation("rightLowerArm", rp.RightLowerArm, 1, armSlerpFactor(13, 15, src3d));
-        rigRotation("leftUpperArm", rp.LeftUpperArm, 1, armSlerpFactor(12, 14, src3d));
-        rigRotation("leftLowerArm", rp.LeftLowerArm, 1, armSlerpFactor(14, 16, src3d));
+        //
+        // D3対策(B案、Kalidokit反映の縮退): 高リーチ域(腕がほぼ矢状面内=カメラ正面方向を向く)では
+        // Kalidokit生Euler(rp.*UpperArm/LowerArm)の分解(atan2連鎖)が縮退し、fused zが正しくても
+        // ボーン方向の符号が暴れる(D3調査参照)。対策として、リーチ度ρ(|fused zの区間差|/骨長を
+        // smoothstepしたもの)が閾値を超えたぶんだけ、fusedのworld 3DベクトルからsetFromUnitVectorsで
+        // 直接構成したクォータニオンをKalidokit値とslerpブレンドする。ρ=0(通常リーチ)域は
+        // Kalidokit生値のみ(既存動作と完全に同一)。Z_METHOD!=="hybrid"またはworld座標なしの場合も
+        // 完全に無効化され、既存のlegacy経路・深度AI経路は不変。
+        {
+          const b3Active = Z_METHOD === "hybrid" && hasWorld && currentVrm && currentVrm.humanoid;
+          const armPairs = [
+            { vs: "right", rpUA: rp.RightUpperArm, rpLA: rp.RightLowerArm, sIdx: 11, eIdx: 13, wIdx: 15, slerpUA: armSlerpFactor(11, 13, src3d), slerpLA: armSlerpFactor(13, 15, src3d) },
+            { vs: "left", rpUA: rp.LeftUpperArm, rpLA: rp.LeftLowerArm, sIdx: 12, eIdx: 14, wIdx: 16, slerpUA: armSlerpFactor(12, 14, src3d), slerpLA: armSlerpFactor(14, 16, src3d) },
+          ];
+          for (const { vs, rpUA, rpLA, sIdx, eIdx, wIdx, slerpUA, slerpLA } of armPairs) {
+            const uaNode = b3Active ? currentVrm.humanoid.getNormalizedBoneNode(vs + "UpperArm") : null;
+            const laNode = b3Active ? currentVrm.humanoid.getNormalizedBoneNode(vs + "LowerArm") : null;
+            let qUA = null, rhoUA = 0;
+            if (uaNode && restDirUA[vs] && src3d[sIdx] && src3d[eIdx]) {
+              rhoUA = updateReachRatio(vs, "ua", Math.abs(src3d[eIdx].z - src3d[sIdx].z) / Math.max(1e-6, L_ua), lastFuseDt);
+              if (rhoUA > 0.001 && rpUA && uaNode.parent) {
+                const qDirect = directBoneQuat(uaNode.parent, src3d[eIdx], src3d[sIdx], restDirUA[vs]);
+                if (qDirect) {
+                  const qK = new THREE.Quaternion().setFromEuler(new THREE.Euler(rpUA.x || 0, rpUA.y || 0, rpUA.z || 0, rpUA.rotationOrder || "XYZ"));
+                  qUA = qK.slerp(qDirect, rhoUA);
+                }
+              }
+            } else if (reachRatioState[vs]) {
+              reachRatioState[vs].ua = expLerp(reachRatioState[vs].ua, 0, lastFuseDt, HZ.REACH_BLEND_TAU);
+            }
+            b3DebugState[vs].ua = { rho: rhoUA, blended: !!qUA };
+            // upperArmは先にここで適用する(=このフレームの目標へslerp)。直後のlowerArm計算が
+            // このボーンの「更新済みワールド回転」を親として使えるようにするため、順序が重要。
+            rigRotationQuat(vs + "UpperArm", qUA, rpUA, slerpUA);
+
+            let qLA = null, rhoFA = 0;
+            if (laNode && restDirFA[vs] && src3d[eIdx] && src3d[wIdx]) {
+              rhoFA = updateReachRatio(vs, "fa", Math.abs(src3d[wIdx].z - src3d[eIdx].z) / Math.max(1e-6, L_fa), lastFuseDt);
+              if (rhoFA > 0.001 && rpLA && laNode.parent) {
+                const qDirect = directBoneQuat(laNode.parent, src3d[wIdx], src3d[eIdx], restDirFA[vs]);
+                if (qDirect) {
+                  const qK = new THREE.Quaternion().setFromEuler(new THREE.Euler(rpLA.x || 0, rpLA.y || 0, rpLA.z || 0, rpLA.rotationOrder || "XYZ"));
+                  qLA = qK.slerp(qDirect, rhoFA);
+                }
+              }
+            } else if (reachRatioState[vs]) {
+              reachRatioState[vs].fa = expLerp(reachRatioState[vs].fa, 0, lastFuseDt, HZ.REACH_BLEND_TAU);
+            }
+            b3DebugState[vs].fa = { rho: rhoFA, blended: !!qLA };
+            rigRotationQuat(vs + "LowerArm", qLA, rpLA, slerpLA);
+          }
+        }
         rigRotation("rightUpperLeg", rp.RightUpperLeg);
         rigRotation("rightLowerLeg", rp.RightLowerLeg);
         rigRotation("leftUpperLeg", rp.LeftUpperLeg);
@@ -2284,6 +2472,11 @@
     };
     return { left: dir("leftUpperArm", "leftLowerArm"), right: dir("rightUpperArm", "rightLowerArm") };
   };
+  // D3対策(B案)ヘッドレス検証用(読み取り専用): 直近フレームの腕別リーチ度ρとブレンド適用有無を返す。
+  window.__b3Probe = () => ({
+    left: { ua: { ...b3DebugState.left.ua }, fa: { ...b3DebugState.left.fa } },
+    right: { ua: { ...b3DebugState.right.ua }, fa: { ...b3DebugState.right.fa } },
+  });
   // 読み取り専用(g1タスク): 指定ボーンのワールド座標{x,y,z}を返す。既定は前後反転バグの実証・
   // 回帰ガードに使う6ボーン。挙動には一切影響しない(rigRotation/rigPosition等の書き込み経路は不使用)。
   window.__boneWorldProbe = (names) => {

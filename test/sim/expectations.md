@@ -1458,3 +1458,188 @@ TIP = MCP + L1·(-n) + L2·(-dir0) + L3·(+n) = MCP - L2·dir0 + (L3-L1)·n
 **実行結果**: `node test/sim/run.mjs`を3回連続実行し、いずれも
 **PASS=22 FAIL=0 SKIP=0 ERROR=0**(既存21ケース+新規1ケース)。`--dry-run`でも22ケース
 (うち任意1件)が正常に一覧表示されることを確認した。
+
+## 17. 統合タスク: D1(符号固着)/D2(手アンカー休眠)/D3(Kalidokit反映の縮退)を一括適用
+
+3件の独立調査報告(D1/D2/D3、各担当がscratchpadで検証済みのパッチ案を提示)を、適用順
+D1→D3→D2で`avatar-depth.html`に統合した(D2は他2件と依存関係が薄いため実際にはD1→D2→D3の
+順で適用したが、相互作用は確認済み。詳細は本タスクの最終報告を参照)。
+
+### 17.1 D1(`resolveSign`の符号固着): 提案パッチをそのまま適用
+
+D1報告の擬似diffと文字どおり一致するパッチ(`HZ.SIGN_OVERRIDE_MS/MULT`定数追加、
+`signState`に`mismatchMs/mismatchSign`追加、`resolveSign(idx,zMag,dt)`にpersistenceベースの
+第2フリップ経路をOR条件で追加、`__resetCalibration`のリセット漏れ修正)を適用。
+`__setSignOverride(ms,mult)`フックを追加(既存の`__setFlipGate`等と同じ流儀)。
+
+### 17.2 D2(手アンカー休眠): 提案パッチをそのまま適用
+
+`updateHandAutoCalSide`/`updateHandAutoCalShoulder`の`handCalStatus==="manual"`無条件return
+ガードを、「その側で実際に値が採れている場合のみロック」に変更(D2報告の擬似diffと同一)。
+
+### 17.3 D3(Kalidokit反映の縮退、B案): 軸マッピングを実測で確定
+
+D3報告のB案(高リーチ度でfused world 3Dベクトルから直接ボーン回転を構成しρブレンド)を実装。
+D3報告の擬似diffには実装済みコードが存在しなかった(D1/D2と異なりscratchpadにpatched HTMLが
+無く、分析スクリプトのみ)ため、本タスクで新規実装した。
+
+**重大な発見: `armProbe.z`の符号規約はCONTRACT.md記載と実際のアバター座標系で逆**。
+CONTRACT.mdは「three.js armProbe.z<0=前方」としているが、`VRMUtils.rotateVRM0`適用後の
+実際のシーンでは、`boneWorldProbe`(hand.z-chest.z>0=前方、既存の複合指標・回帰ガード)と
+`armProbe`(shoulder→elbowの方向ベクトル)は**同じワールド座標系で計算されているにも関わらず、
+物理的に正しい前方リーチでは`armProbe.z`は正の値になる**ことを、3つの独立したヘッドレス実測
+(`__simReach(85)`でのpunchDz比較、`__simReach3D(90,±40)`での上下関係比較、
+`__setReachBlend(-0.1,-0.05)`でρ=1を強制したT-poseでのarmProbe.x比較。詳細はscratchpad
+`d3int_axischeck*.mjs`/`d3int_yzcheck*.mjs`/`d3int_xcheck.mjs`)で確認した。CONTRACT.mdの
+記述は恐らくmediapipe生worldのz規約について述べたもので、Kalidokit経由でリターゲットされた
+VRMボーンの方向ベクトルには(このモデル・シーン設定では)そのまま適用できない。
+
+この発見に基づき、mediapipeのfused world位置をVRMワールド方向として使う際は、**isVRM0の
+アバターでは(x,y,z)全軸を反転**する必要があることを確認した(`directBoneQuat`内の
+`b3Flip = isVRM0 ? -1 : 1`)。VRM1モデルでの検証はサンプルモデル未入手のため未実施(既存の
+矢状角パッチのVRM0/VRM1分岐と同じ既知の限界)。この軸反転により、`boneWorldProbe`の
+`punchDz`/`chamberDz`(既存の背中方向リーチ回帰)は一切劣化させずに、`armProbe`の方向自体を
+Kalidokitの生オイラー分解から解放することができた。
+
+### 17.4 リーチ度ρしきい値の調整(引き手/チャンバーとの衝突を実測で発見・修正)
+
+D3報告が目安として挙げた`REACH_BLEND_LO=0.6, HI=0.85`をそのまま使うと、既存の
+正拳突きシミュレーション(`buildPosePunch`)の引き手(チャンバー)姿勢
+(`CHAMBER_UA_DEG=40°→sin40°=0.643`, `CHAMBER_FA_DEG=50°→sin50°=0.766`)がしきい値を
+わずかに超えてしまい、突いていない側の手が意図せず前方へブレンドされ、`new-punch-static`の
+`chamberDz`(要`<0.05`)が`0.070`まで悪化する回帰が実測で見つかった。これは「z比率が高い=
+高リーチ」という単純な指標が、チャンバーのような「上下方向中心だが前後方向にもそれなりの
+角度を持つ」姿勢と、D3が本来ターゲットとする「ほぼ真正面(outward≈0)への伸展」姿勢を
+区別できないために生じる。チャンバー比の最大値(前腕側`0.766`)に対し余裕を持たせ、
+`REACH_BLEND_LO=0.8, HI=0.92`に調整して解消した(§17.6のsim結果で確認)。
+
+### 17.5 統合後の相互作用確認
+
+- D1とD3は同じ`fuseArmZ`出力(`src3d[idx].z`)を介して繋がる(D1が符号を安定化させたfused zを
+  D3のρ計算・direct quaternion計算がそのまま使う)。D1適用前後でD3のρ発火パターンが変わる
+  可能性を考慮し、D1→D3の順で適用後にsim/実写両方で回帰確認した。
+- D2はhandCal/handAnchor経路のみに閉じており、D1/D3(腕z・ボーン回転経路)とはコード上
+  重複しない。3件を同時適用した状態でもD2の新規回帰ケース(§17.7)は独立してPASSする。
+- `Z_METHOD==="hybrid"`のみで全機構が有効になる設計を維持したため、`legacy`方式は3件とも
+  無改変(ヘッドレスで`__setZMethod("legacy")`+`__simReach(60)`+`__armProbe()`実行し、
+  NaN/例外が出ないことのみ確認。legacy方式は元々armProbe方向の理論値を持たないため数値検証はしていない)。
+
+### 17.6 sim回帰結果
+
+`node test/sim/run.mjs`を3回連続実行し、いずれも**PASS=25 FAIL=0 SKIP=0 ERROR=0**
+(既存22ケース+新規3ケース)。特に以下を個別確認した:
+
+- `regression-reach45`: `elbowZ=-0.1909`(修正前と完全一致)。
+- `new-punch-static`/`new-punch-reach85`/`new-punch-ui-autocal`: `punchDz`/`punchOx`/
+  `chamberDz`いずれも修正前とほぼ同水準(`punchDz`は`0.3784→0.3962`、D1のsign改善分の
+  差異でわずかに変化するが`>0.30`の判定基準は変わらずPASS)。
+- `new-punch-cycle`: `totalFlips=20`、`gateFlips`も修正前と完全一致。
+
+### 17.7 新規回帰ケース
+
+- **`new-handanchor-rescue-after-failed-manual-cal`**(D2): tpose(手なし)で手動較正を完走→
+  `handCalStatus="manual"`かつ手サイズ欠損を確認→T-pose+手ありを2.5秒流す→`__simReachHand(60,1)`で
+  `handAnchor.left.{r,w}`が非null/非ゼロ(`r>0.5`かつ`w>0`)になることを確認。**修正前のコードで
+  実行するとFAIL(`r=null,w=0`のまま)することを確認済み**。
+- **`new-b3-forearm-singularity-az90`**(D3): `__simReach3D(az,elev=6,"left")`をaz=84..96で
+  2°刻みに掃引し、前腕方向(`boneWorldProbe`のelbow→hand)の隣接差分(単位ベクトル距離/°)の
+  最大値が`0.10`未満であることを検証。修正後の実測は`maxJumpPerDeg≈0.018`。**修正前のコードで
+  実行すると`maxJumpPerDeg≈0.230`でFAILし、D3調査報告の実測(az=88→90で+0.06→-0.79、
+  最大傾き0.19/°)と同水準の不安定性を再現することを確認済み**。
+- **`new-d1-sign-override-persistence`**(D1): `__simReach(75)`(zMagが常に大きい高リーチ姿勢)で
+  手首の符号を+1に確立後、フェイク深度(`__setFakeDepth`)で強い逆符号証拠を与え、
+  `SIGN_OVERRIDE_MS(200ms)`未満では反転せず、それを超えると反転することを確認。
+  肘(idx13、refIdx=肩)ではなく手首(idx15、refIdx=肘)で検証している(肘は参照点が肩となり
+  `refEma`経由の遅いEMA(`REF_EMA_TAU=1.0s`)を挟むため短時間検証に不向きなことを実測で確認した
+  ための選択で、機構自体は同一)。**修正前のコードでは`__setSignOverride`フック自体が存在しない
+  ためSKIP(hook-missing)になる**(新機構であることの確認)。
+
+### 17.8 実写`punch.y4m`での検証(before/after)
+
+`test/tracking/probe-avatar.mjs --media punch`相当の手法(50ms間隔、124サンプル)で、
+修正前(D1/D2/D3すべて未適用)と修正後(3件すべて適用)を比較した。
+
+**D1: 生z符号とfused z符号の一致率**(`__visProbe`の`{elbow,wrist}RawZ` vs `__zProbe`の
+`{elbowZ,wristZ}`、|値|>0.02のフレームのみ):
+
+| 関節 | 修正前 | 修正後 |
+|---|---|---|
+| 左肘 | 76.4% | 78.2% |
+| 右肘 | 56.8% | 66.4% |
+| 左手首 | 71.4% | 73.6% |
+| 右手首 | 70.9% | 72.2% |
+| **全体** | **68.9%** | **72.6%** |
+
+D1報告が実測した数値(右肘54.4%→65.8%、独立プローブ)とほぼ同水準の改善が本統合版でも
+再現された。
+
+**D3: `fused Z`と`armProbe.z`の関係**: §17.3の発見(符号規約がCONTRACT.mdと逆)により、
+「fused zと同符号になる割合」という素朴な指標はD3の成功を測る指標として不適切であることが
+判明した(理論上、正しく修正されたarmProbe.zはfused zと**逆符号**で相関するのが物理的に
+正しい)。実測では前後どちらの符号規約で見ても実写`punch.y4m`上の相関ははっきりしない
+(修正前後で相関係数は概ね|corr|<0.35の範囲に留まり、明確な改善/悪化は主張できない)。
+これは(a)実写ではボクシンググローブによる遮蔽で腕のvisibilityが低下し、Layer2(動的暴れ)の
+影響が支配的になること、(b)`REACH_BLEND_LO=0.8`という(§17.4のチャンバー衝突を避けるための)
+やや保守的なしきい値により、上腕側のブレンドがこの実写クリップでは`ρ_ua`最大`0.22`程度までしか
+発火しないこと(前腕側は`ρ_fa`最大`0.98`まで発火し、こちらは§17.7の`new-b3-forearm-singularity`
+回帰で改善を確認済み)が原因と考えられる。**この実写クリップでの上腕チャンネルの改善は
+sim(§17.6)ほど明確には実証できていない**ことを正直に報告する(§17.9参照)。
+
+### 17.9 未適用/残課題
+
+1. **D1のsim回帰**: `resolveSign`のオーバーライド経路そのものをsimで検証するケースは
+   `new-d1-sign-override-persistence`で追加したが、肘(refIdx=肩)側は`refEma`の遅いEMA
+   (`REF_EMA_TAU=1.0s`)が絡むため短時間のsimでは検証しづらく、手首(refIdx=肘)側でのみ
+   直接検証している。肘側の挙動は実写`punch.y4m`(§17.8、右肘56.8%→66.4%)でのみ確認済み。
+2. **D3上腕チャンネルの実写クリップでの効果**: §17.8のとおり、`punch.y4m`はボクシンググローブ
+   遮蔽と保守的なしきい値(§17.4)の両方の理由で上腕側のブレンドがあまり発火せず、改善量を
+   実写で明確に主張できない。`REACH_BLEND_LO`を下げれば発火頻度は上がるが、チャンバー姿勢との
+   衝突マージンが縮む(§17.4のトレードオフ)ため、本タスクでは安全側(チャンバー保護優先)を
+   選んだ。素手・グローブなしでの前方突き実写クリップがあれば、より明確な検証が可能。
+3. **`armProbe.z`符号規約の食い違い(§17.3)**: CONTRACT.mdの記述と実際のアバター座標系の
+   矛盾は、CONTRACT.md自体の更新(mediapipe生worldの規約とVRMボーン方向ベクトルの規約は
+   別物であると明記する)が望ましいが、本タスクの権限外(ドキュメント更新は指示されていない)
+   のため、本ファイルへの実測記録に留めた。
+4. **VRM1モデルでの`directBoneQuat`軸反転の検証**: `isVRM0`分岐の反転則はVRM0モデル
+   (同梱サンプル)でのみ実測確認済み。VRM1実機モデルが手元にないため未検証(既存の矢状角
+   パッチと同じ既知の限界、コード内コメントに明記)。
+
+## 18. 独立QC(敵対的レビュー)で発見・修正: SIGN_OVERRIDE(D1)がvisibilityを見ていなかった
+
+§17.1のD1パッチ(`resolveSign`のSIGN_OVERRIDE persistence経路)を独立検証したところ、
+`resolveSign`自体がvisibilityを一切参照していないことが判明した。既存のzMagベースの
+フリップ条件(`flipByZMag`)は「zMagが小さい(体側平面通過付近)」という幾何拘束のおかげで
+発火機会が限られるのに対し、新しいpersistence経路は幾何拘束なしに任意の姿勢・任意の
+継続時間で成立し得る。
+
+**実測での再現**(ヘッドレスPlaywright、`__simVis`+`__setFakeDepth`を手動組み合わせ):
+1. `__simReach(75)`でsign=+1を確立(zMagは常に大きく、旧ゲートは閉じたまま)。
+2. `__simVis`で手首(idx15)のvisibilityをVIS_GATE_MIN(0.5)未満の0.3に固定(`gatedFuseWrite`が
+   出力を凍結する条件)。
+3. `__setFakeDepth((nx)=>-nx*1000)`で強い逆符号証拠を注入し700ms保持(SIGN_OVERRIDE_MS=200ms
+   を大幅に超過)。
+4. **出力(wristZ)は凍結どおり変化しない(見た目は正常)が、`__zProbe().left.signWrist`が
+   密かに`-1`へ反転していることを確認**。
+5. その状態でvisibilityを1.0へ戻すと、凍結が解除された瞬間に出力が`wristZ=-0.50→-0.04`へ
+   ジャンプする(=低vis中に裏で確定した誤った符号が、tracking回復の瞬間に露呈する「ポップ」)。
+6. 同一手順を本タスク適用前のHEAD(`resolveSign`にSIGN_OVERRIDE機構が無い版)で実行すると
+   一切反転しない(新規リスクであり、既存のzMagゲートには無い性質であることを確認)。
+
+**修正**: `resolveSign(idx, zMag, dt, vis)`に第4引数`vis`(対象ランドマーク自身の
+visibility)を追加し、`strongMismatch`の成立条件に`vis == null || vis >= HZ.VIS_GATE_MIN`
+を追加した(`gatedFuseWrite`が出力を凍結しない条件と同じ閾値を再利用)。低vis中は
+`mismatchMs`が毎フレーム0にリセットされ続けるため蓄積が進まず、visが回復してから改めて
+SIGN_OVERRIDE_MS分の持続証拠を要求するようになる。呼び出し側2箇所
+(`resolveSign(elbow,...)`/`resolveSign(wrist,...)`)に`world[elbow].visibility`/
+`world[wrist].visibility`を渡すよう変更した。
+
+**回帰ガード**: `new-d1-sign-override-requires-visibility`を追加。修正前(vis条件を
+外した状態)で実行するとFAILすることを確認済み(negative control、詳細はタスク最終報告参照)。
+
+**再検証結果**: 修正後もsim全26ケース(既存25+本ケース)PASS(3回連続)。修正は
+`resolveSign`の第4引数追加とstrongMismatch条件へのAND追加のみで、シミュレーション経路
+(vis既定=1.0で常に`visOkForOverride=true`)の挙動・数値には一切影響しない
+(`new-d1-sign-override-persistence`のlongHoldSignが従来どおり680ms後に反転することで確認)。
+実写`punch.y4m`でのD1改善(§17.8)も再測定し、全体一致率は約71〜72%(修正前と同水準、
+run間で real-time video decode のタイミングにより±3〜5pt程度変動することを複数回の
+独立実行で確認済み)を維持しており、修正によるD1の効果縮小は見られない。

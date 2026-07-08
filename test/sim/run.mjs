@@ -1619,6 +1619,286 @@ const CASES = [
       };
     },
   },
+  {
+    // D2回帰: 手動較正の間じゅう手が検出されずhandCalStatus="manual"がd09_0/d517_0空のままロックされても、
+    // 較正完了後にT-pose相当+手ありの姿勢を十分な時間見せれば自動フォールバック(updateHandAutoCalSide/
+    // Shoulder)がその後d09_0/d517_0(またはW_m/w_n)を埋め、手アンカーのr/wが発火するようになることを確認する。
+    // 修正前は`if (handCalStatus === "manual") return;`の無条件ガードにより、この側の自動学習が
+    // 較正完了後は永久に無効化され、r=null・w=0のまま固着していた(D2調査報告参照)。
+    id: "new-handanchor-rescue-after-failed-manual-cal",
+    desc:
+      "手なしでの手動較正完了(handCalStatus=manual, d09_0/d517_0は空)→その後T-pose+手ありを長時間表示→" +
+      "自動フォールバックがhandCal側の値を埋め、handAnchor.left.{r,w}が非null/非ゼロになる",
+    requiredHooks: ["__resetCalibration", "__simPose", "__simReachHand", "__calProbe", "__zProbe"],
+    async run(page) {
+      await evalHook(page, "__resetCalibration", []);
+      await evalHook(page, "__simPose", ["tpose"]); // 手ランドマーク無し
+      const hasCalBtn = await page.evaluate(() => !!document.getElementById("calBtn"));
+      if (!hasCalBtn) {
+        const e = new Error("#calBtn が見つからない(手動較正UIが無い)");
+        e.hookMissing = true;
+        throw e;
+      }
+      await page.click("#calBtn");
+      await sleep(3500); // MANUAL_CAL_MS(3000ms)+余裕。この時点でhandCalStatus="manual"かつ手サイズは空のはず
+      const afterManualCal = await page.evaluate(() => ({
+        calProbe: window.__calProbe(),
+        handAnchorRightAfterCal: window.__zProbe().handAnchor.left, // まだ手を出していないのでnull/0のはず
+      }));
+
+      // T-pose相当+手あり(ρ≈0、画面平行)をCAL_SAMPLE_MAX(90)を大きく超える時間流し、
+      // 自動フォールバックのランニング中央値バッファを十分に埋める。
+      await evalHook(page, "__simReachHand", [0, 1]);
+      await sleep(2500);
+
+      // 実際にreachさせて手アンカーが発火するか確認する。
+      await evalHook(page, "__simReachHand", [60, 1]);
+      const conv = await pollUntilStable(page);
+      const handAnchor = conv.probe?.handAnchor?.left ?? null;
+      return { afterManualCal, handAnchor };
+    },
+    assert(result) {
+      const cp = result.afterManualCal.calProbe;
+      const lockedWithoutHandSize =
+        cp?.ok?.handLeft === false && cp?.ok?.handRight === false; // 較正完了時点では手サイズ欠損のはず
+      const haBeforeReach = result.afterManualCal.handAnchorRightAfterCal;
+      const haBeforeIsIdle = haBeforeReach && (haBeforeReach.w === 0 || haBeforeReach.w == null) && haBeforeReach.r == null;
+      const ha = result.handAnchor;
+      const rescued = ha != null && ha.r != null && ha.r > 0.5 && ha.w != null && ha.w > 0;
+      const pass = lockedWithoutHandSize && haBeforeIsIdle && rescued;
+      const detail =
+        `較正直後: handCalStatus的ok=${JSON.stringify(cp?.ok)}(手サイズ欠損期待) handAnchor(reach前)=${JSON.stringify(haBeforeReach)} / ` +
+        `reach後: handAnchor.left=${JSON.stringify(ha)}(要 r>0.5 かつ w>0 = 自動フォールバックで救済)`;
+      return {
+        pass,
+        detail,
+        actual: { lockedWithoutHandSize, haBeforeIsIdle, handAnchor: ha },
+        expected: { lockedWithoutHandSize: true, haBeforeIsIdle: true, "handAnchor.r": "> 0.5 (non-null)", "handAnchor.w": "> 0" },
+      };
+    },
+    dryRunPreview() {
+      return {
+        note:
+          "D2調査報告の再現手順そのもの: tpose(手なし)で手動較正を完走させるとhandCalStatus=\"manual\"が" +
+          "無条件でロックされ、以後updateHandAutoCalSide/Shoulderの`if (handCalStatus===\"manual\") return;`で" +
+          "自動学習が永久に無効化される(修正前)。修正後は「その側で実際に値が採れている場合のみ」ロックする" +
+          "ため、較正失敗後でもT-pose+手ありを見せればhandCal.d09_0/d517_0・W_m/w_nが埋まり、handAnchorが復活する。",
+      };
+    },
+  },
+  {
+    // D3回帰(Layer3: 前腕の特異点)。__simReach3D(azimDeg,elevDeg,"left")はmediapipe添字14/16
+    // (VRM"right"の腕、既存のarmPairs/rigRotation添字対と同じ)を指定角度に伸ばす。az=90(=真正面)
+    // 付近では前腕(elbow→hand)の2D投影がKalidokit生値ではatan2分解が縮退し、D3調査報告の実測では
+    // az=88→90のわずか2°でforearmDirZが-0.45→-0.79へ、az=90→92で-0.79→-0.48へ急変(最大傾き0.19/°)
+    // していた。B案(直接ベクトル+ρブレンド)適用後は、この帯域でのρが十分高くなり(このモジュールの
+    // 前段テストで実測済み: 実写punch.y4mでも前腕側のρが最大0.98まで上がる)、fusedのworld方向を
+    // 直接使うため、Kalidokitのatan2縮退の影響を受けなくなり隣接角度間の変化が滑らかになるはず。
+    id: "new-b3-forearm-singularity-az90",
+    desc: "__simReach3D(az,elev=6,\"left\")をaz=84..96で2°刻みに掃引→前腕方向(elbow→hand)の隣接差分がD3調査時の実測ピーク(0.19/°)を大幅に下回る",
+    requiredHooks: ["__resetCalibration", "__setManualCal", "__simReach3D", "__boneWorldProbe"],
+    async run(page) {
+      await resetAndCal(page);
+      const azList = [84, 86, 88, 90, 92, 94, 96];
+      const dirs = [];
+      for (const az of azList) {
+        await evalHook(page, "__simReach3D", [az, 6, "left"]); // side="left"→mediapipe14/16→VRM"right"が伸展
+        const conv = await pollUntilStable(page, { maxMs: 4000 });
+        const bw = await page.evaluate((names) => window.__boneWorldProbe(names), ["rightLowerArm", "rightHand"]);
+        const elbow = bw?.rightLowerArm, hand = bw?.rightHand;
+        let dir = null;
+        if (elbow && hand) {
+          const dx = hand.x - elbow.x, dy = hand.y - elbow.y, dz = hand.z - elbow.z;
+          const len = Math.hypot(dx, dy, dz);
+          if (len > 1e-6) dir = { x: dx / len, y: dy / len, z: dz / len };
+        }
+        dirs.push({ az, dir, converged: conv.converged });
+      }
+      return { dirs };
+    },
+    assert(result) {
+      const dirs = result.dirs;
+      let maxJumpPerDeg = 0;
+      const jumps = [];
+      for (let i = 1; i < dirs.length; i++) {
+        const a = dirs[i - 1].dir, b = dirs[i].dir;
+        const degStep = dirs[i].az - dirs[i - 1].az;
+        if (!a || !b || !(degStep > 0)) { jumps.push(null); continue; }
+        const jump = Math.hypot(b.x - a.x, b.y - a.y, b.z - a.z) / degStep;
+        jumps.push(jump);
+        if (jump > maxJumpPerDeg) maxJumpPerDeg = jump;
+      }
+      const allFinite = dirs.every((d) => d.dir && Number.isFinite(d.dir.z));
+      const pass = allFinite && maxJumpPerDeg < 0.10; // D3調査時の実測ピーク0.19/°を大幅に下回ることを要求
+      const detail =
+        `az=${dirs.map((d) => d.az).join(",")} / forearmDirZ=${dirs.map((d) => fmt(d.dir?.z)).join(",")} / ` +
+        `jumps(単位ベクトル距離/°)=${jumps.map((j) => (j == null ? "null" : j.toFixed(4))).join(",")} / ` +
+        `maxJumpPerDeg=${maxJumpPerDeg.toFixed(4)}(要<0.10、D3調査時実測ピーク相当0.19超は明確な悪化) allFinite=${allFinite}`;
+      return {
+        pass,
+        detail,
+        actual: { dirs, maxJumpPerDeg },
+        expected: { maxJumpPerDeg: "< 0.10", allFinite: true },
+      };
+    },
+    dryRunPreview() {
+      return {
+        note:
+          "D3調査報告§2.3の実測(az=85→90でforearmDirZ=+0.060→-0.791、az=90→92で-0.791→-0.480、" +
+          "最大傾き0.19/°)を単位ベクトル距離ベースの指標で再現・回帰ガード化したもの。修正前のavatar-depth.html" +
+          "(このタスクのB案適用前)で実行するとmaxJumpPerDegが0.10を大きく超えることを確認済み(統合時の" +
+          "before/after実測は本タスクの報告本文を参照)。",
+      };
+    },
+  },
+  {
+    // D1回帰: resolveSignのSIGN_OVERRIDE機構(zMagゲートが開かない矢状面内リーチでも、強い逆符号の
+    // 生z/深度証拠がSIGN_OVERRIDE_MS以上持続すれば反転を許可する)を、フェイク深度(既存の
+    // optional-fakedepth-signと同じ仕組み)で単体検証する。__simReach(75)は肘のzMag(≈0.26m)が
+    // FLIP_ZMAG_THRESH(0.05m)を大きく超えたまま変化しない姿勢なので、zMagゲート単体では
+    // 一切反転できない(=反転が起きればそれはSIGN_OVERRIDE経路のみによる)。
+    id: "new-d1-sign-override-persistence",
+    desc:
+      "高リーチ(zMag大)姿勢で手首の符号を+1に確立→フェイク深度で強い逆符号証拠を与える→SIGN_OVERRIDE_MS未満では反転せず、" +
+      "十分な時間持続すると反転する(zMagゲートは常に閉じたまま)",
+    requiredHooks: ["__resetCalibration", "__setManualCal", "__simReach", "__setFakeDepth", "__zProbe", "__setSignOverride"],
+    async run(page) {
+      await page.evaluate(
+        ({ ua, fa }) => {
+          window.__resetCalibration();
+          window.__setManualCal(ua, fa);
+          window.__setSignOverride(200, 1.5); // 既定値を明示固定(将来デフォルト変更の影響を受けないようにする)
+          window.__simReach(75); // フォールバック(生z比較)経由でsign=+1に収束するはずの高リーチ姿勢
+        },
+        { ua: U, fa: F }
+      );
+      await sleep(1000);
+      const initProbe = await page.evaluate(() => window.__zProbe());
+      // 手首(idx15)で観測する: refIdx=肘(13)なのでsampleArmPointDepthAligned経由のスコアになり、
+      // フェイク深度切り替え直後から安定してスコアが得られる(肘(idx13)はrefIdx=肩(11)で
+      // refEma[11]経由になり、REF_EMA_TAU=1.0sの遅いEMA収束を待つ必要があるため短時間検証に不向き)。
+      const initSign = initProbe?.left?.signWrist ?? null;
+
+      // フェイク深度を「手首は肘より奥」= 生z比較と逆符号になる向きへ強く固定する(optional-fakedepth-signで
+      // 検証済みの関数と同じもの)。姿勢(__simReach(75))自体は変えないのでzMagは変化しない。
+      await page.evaluate(() => window.__setFakeDepth((nx) => -nx * 1000));
+      await sleep(80); // SIGN_OVERRIDE_MS(200ms)未満
+      const shortHoldSign = (await page.evaluate(() => window.__zProbe())).left?.signWrist ?? null;
+
+      await sleep(600); // 追加で待ち、フェイク深度に切り替えてからの合計持続時間を200msを十分超えさせる
+      const longHoldSign = (await page.evaluate(() => window.__zProbe())).left?.signWrist ?? null;
+
+      await page.evaluate(() => {
+        if (typeof window.__setFakeDepth === "function") window.__setFakeDepth(null);
+      });
+      return { initSign, shortHoldSign, longHoldSign };
+    },
+    assert(result) {
+      const pass = result.initSign === 1 && result.shortHoldSign === 1 && result.longHoldSign === -1;
+      const detail =
+        `initSign=${fmt(result.initSign)}(要+1) shortHold(80ms後)=${fmt(result.shortHoldSign)}(要+1、まだ反転しない) ` +
+        `longHold(680ms後)=${fmt(result.longHoldSign)}(要-1、SIGN_OVERRIDE経由で反転)`;
+      return {
+        pass,
+        detail,
+        actual: result,
+        expected: { initSign: 1, shortHoldSign: 1, longHoldSign: -1 },
+      };
+    },
+    dryRunPreview() {
+      return {
+        note:
+          "D1調査報告の核心(矢状面内リーチではzMagがFLIP_ZMAG_THRESHを跨がず既存ゲートが開かない)を" +
+          "フェイク深度で決定論的に再現する。修正前のresolveSign(SIGN_OVERRIDE機構なし)ではlongHoldSignも" +
+          "+1のまま反転しないはず(zMagゲートしか反転経路が無いため)。",
+      };
+    },
+  },
+  {
+    // QCレビュー(独立検証)で発見: 上のnew-d1-sign-override-persistenceが実証するSIGN_OVERRIDE経路は
+    // 元々visibilityを一切見ていなかった。gatedFuseWriteの出力側ヒステリシス(vis<VIS_GATE_MINで凍結)は
+    // 「見た目」を安定させるだけで、resolveSign内部のsignState/mismatchMsは低visibility中も裏で
+    // 蓄積・反転できてしまい、visが回復した瞬間に凍結が解けて突然逆符号の値へ「ポップ」する実測を
+    // 確認した(手動の低vis+フェイク深度実験。修正前のavatar-depth.htmlで再現、修正後のHEADでは
+    // 発生しないことも確認済み)。対策としてresolveSignにvisを渡し、strongMismatchはvisがVIS_GATE_MIN
+    // 以上のフレームでしか成立しないようにした(低vis中はmismatchMsが0にリセットされ続け、蓄積が進まない)。
+    id: "new-d1-sign-override-requires-visibility",
+    desc:
+      "high-reach(zMag大)姿勢で手首の符号を+1に確立→手首のvisibilityをVIS_GATE_MIN未満に下げたまま" +
+      "フェイク深度で強い逆符号証拠をSIGN_OVERRIDE_MSより十分長く与えても反転しない(出力凍結中に" +
+      "内部状態だけ反転して回復時にポップする、を防ぐ)→visを1へ戻すと(同じ逆符号証拠のまま)反転する",
+    requiredHooks: ["__resetCalibration", "__setManualCal", "__simVis", "__setFakeDepth", "__zProbe", "__setSignOverride"],
+    async run(page) {
+      await page.evaluate(
+        ({ ua, fa }) => {
+          window.__resetCalibration();
+          window.__setManualCal(ua, fa);
+          window.__setSignOverride(200, 1.5);
+          window.__simVis("reach75", {}); // reach75(vis既定=1)でsign=+1を確立
+        },
+        { ua: U, fa: F }
+      );
+      await sleep(1000);
+      const initProbe = await page.evaluate(() => window.__zProbe());
+      const initSign = initProbe?.left?.signWrist ?? null;
+
+      // 手首(idx15)のvisibilityだけVIS_GATE_MIN(0.5)未満(0.3)に下げる。姿勢(zMag)自体は不変。
+      await page.evaluate(() => window.__simVis("reach75", { 15: 0.3 }));
+      await sleep(100);
+      // 出力が凍結される前提を確認するため、フェイク深度注入前のwristZを控えておく
+      const frozenBaseline = (await page.evaluate(() => window.__zProbe())).left?.wristZ ?? null;
+
+      await page.evaluate(() => window.__setFakeDepth((nx) => -nx * 1000));
+      await sleep(900); // SIGN_OVERRIDE_MS(200ms)を大幅に超えて低visのまま保持
+      const lowVisHoldProbe = await page.evaluate(() => window.__zProbe());
+      const lowVisHoldSign = lowVisHoldProbe?.left?.signWrist ?? null;
+      const lowVisHoldWristZ = lowVisHoldProbe?.left?.wristZ ?? null;
+
+      // visを1へ戻す(フェイク深度の逆符号証拠は維持したまま)。ここから改めてSIGN_OVERRIDE_MSを
+      // 満たせば反転してよい。
+      await page.evaluate(() => window.__simVis("reach75", { 15: 1.0 }));
+      await sleep(500);
+      const recoveredProbe = await page.evaluate(() => window.__zProbe());
+      const recoveredSign = recoveredProbe?.left?.signWrist ?? null;
+
+      await page.evaluate(() => {
+        if (typeof window.__setFakeDepth === "function") window.__setFakeDepth(null);
+      });
+      return { initSign, frozenBaseline, lowVisHoldSign, lowVisHoldWristZ, recoveredSign };
+    },
+    assert(result) {
+      // 低vis中はsignが反転せず、出力(wristZ)も凍結時の値からほぼ動かないこと。visが戻ってから
+      // 改めて反転すること。
+      const outputStayedFrozen =
+        result.frozenBaseline != null &&
+        result.lowVisHoldWristZ != null &&
+        Math.abs(result.lowVisHoldWristZ - result.frozenBaseline) < 0.02;
+      const pass =
+        result.initSign === 1 &&
+        result.lowVisHoldSign === 1 &&
+        outputStayedFrozen &&
+        result.recoveredSign === -1;
+      const detail =
+        `initSign=${fmt(result.initSign)}(要+1) / 低vis(0.3)900ms保持後: sign=${fmt(result.lowVisHoldSign)}(要+1、反転しない) ` +
+        `wristZ=${fmt(result.lowVisHoldWristZ)} vs 凍結直前基準=${fmt(result.frozenBaseline)}(差<0.02が出力凍結の証拠) / ` +
+        `vis復帰後500ms: sign=${fmt(result.recoveredSign)}(要-1、証拠が残っていれば改めて反転してよい)`;
+      return {
+        pass,
+        detail,
+        actual: result,
+        expected: { initSign: 1, lowVisHoldSign: 1, outputStayedFrozen: true, recoveredSign: -1 },
+      };
+    },
+    dryRunPreview() {
+      return {
+        note:
+          "QCレビューが独立実測で発見した穴(SIGN_OVERRIDE経路がvisibilityを見ていないため、低vis中に" +
+          "signStateだけ裏で反転し、vis回復時に出力がポップする)の回帰ガード。この修正前のコード" +
+          "(new-d1-sign-override-persistenceがマージされた直後、visゲートを足す前)で実行すると" +
+          "lowVisHoldSignが-1になりFAILするはず(低vis中に反転してしまうため)。",
+      };
+    },
+  },
 ];
 
 // =============================================================================
