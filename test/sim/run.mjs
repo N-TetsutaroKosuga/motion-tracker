@@ -1054,7 +1054,17 @@ const CASES = [
     // h1タスク新規ケース: 正拳突き(punch)静止ポーズ。buildPosePunch("left",85)は
     //   突き腕(左, 11-13-15): buildPoseReachの片腕版と同じ数学(elbowZ=-U*sinθ, wristZ=-(U+F)*sinθ)。
     //   引き手(右, 12-14-16, チャンバー): セグメント長U/F厳守の閉形式(avatar-depth.htmlのchamberUaDir/
-    //   chamberFaDir、導出はexpectations.md参照)。elbowZ=+U*sin(20°)>0(体より後ろ)。
+    //   chamberFaDir、導出はexpectations.md参照)。elbowZ=+U*sin(CHAMBER_UA_DEG)>0(体より後ろ)。
+    //   g-fist1タスクでCHAMBER_UA_DEGを20°→40°に変更した(引き手ちらつきのsim限定安定化、
+    //   expectations.md該当節参照)ため、このケースのelbowZ理論値もU*sin(40°)に追従する。
+    // g-fist1タスク追記: 突き手はmakeHand(開き手)ではなくmakeFist(拳)を使うようavatar-depth.html側を
+    // 変更した。本ケースに「突き手が握られている」検証(__fingerProbe)を追加する: makeFist(curl=1)は
+    // 各指の全関節で内角90°(KalidokitのnormalizeRadians写像が最大値0.5を返す角度)になるよう設計して
+    // おり、rigFingers適用後の各指ボーンのローカルz回転は理論値ちょうど-π/2(側がRightのためinvert=1)。
+    // 開き手(旧makeHand)ではこの値は0(Intermediate/Distal)または横開き由来の小さな値(Proximal、
+    // 実測|z|≤0.455)にしかならないため、しきい値1.0rad(理論値-π/2≈-1.571の約64%、開き手の実測最大値
+    // 0.455の2倍以上)で握り込みを判定すれば開き手/拳を明確に弁別できる(実測でも全12関節がちょうど
+    // -1.5708になることを確認済み、詳細は本タスクの報告参照)。
     // Phase1/Phase2に分けているのは、makeHandで手ランドマークを付与するとHAND_ANCHOR_ENABLED既定trueの
     // 手アンカー機構が(手較正済みなら)作動し、extendDeg=85でのリーチ度ρが高いため全重み(w=1)で
     // elbowZ/wristZをプレーンなチェーン理論値から2ボーンIK再構成値へ上書きしてしまうため
@@ -1078,8 +1088,9 @@ const CASES = [
     desc:
       "__simPunch(\"left\",85): 突き腕(z1.left, mediapipe添字13/15)elbowZ/wristZが理論値、" +
       "引き手(z1.right, mediapipe添字14/16)elbowZ>0(体より後ろ)、" +
-      "boneWorldProbe(VRMボーン名, 突き腕=rightHand/引き手=leftHand)で前後・横方向が正しい、手アンカー較正時はr≈1.4",
-    requiredHooks: ["__resetCalibration", "__setManualCal", "__simPunch", "__zProbe", "__boneWorldProbe", "__setHandCal"],
+      "boneWorldProbe(VRMボーン名, 突き腕=rightHand/引き手=leftHand)で前後・横方向が正しい、手アンカー較正時はr≈1.4、" +
+      "突き手(rightHand)の指ボーンがmakeFistにより握り込まれている(|z|>1.0rad)",
+    requiredHooks: ["__resetCalibration", "__setManualCal", "__simPunch", "__zProbe", "__boneWorldProbe", "__setHandCal", "__fingerProbe"],
     async run(page) {
       // Phase 1: 手アンカー未較正(既定)。チェーン理論値とboneWorldProbe(前後)を検証する。
       // reset→cal→simPunchを単一のpage.evaluateで原子的に実行する: 別々のevaluateに分けると、
@@ -1104,6 +1115,9 @@ const CASES = [
         (names) => window.__boneWorldProbe(names),
         ["leftHand", "rightHand", "leftShoulder", "rightShoulder", "chest"]
       );
+      // 突き手(mediapipe11/13/15)はVRM"right"側を駆動する(このケース冒頭の注記と同じ根拠)ため、
+      // 握り込み確認は__fingerProbe("right")で行う。
+      const fp1 = await page.evaluate(() => window.__fingerProbe("right"));
 
       // Phase 2: 手アンカー較正済み(HAND_CAL_FIXTURE, handScale基準1.0)。r≈1.4のみを検証する。同じ理由で原子的に実行する。
       await page.evaluate(
@@ -1118,7 +1132,7 @@ const CASES = [
       );
       const conv2 = await pollUntilStable(page);
 
-      return { z1: conv1.z, bw1, r: conv2.probe?.handAnchor?.left?.r ?? null };
+      return { z1: conv1.z, bw1, fp1, r: conv2.probe?.handAnchor?.left?.r ?? null };
     },
     assert(result) {
       const theory = {
@@ -1147,16 +1161,25 @@ const CASES = [
       const punchNotSideways = punchOx != null && Math.abs(punchOx) < 0.2;
       const chamberNotFwd = chamberDz != null && chamberDz < 0.05;
       const rOk = within(result.r, 1.4, 0.1, "rel");
-      const pass = base.pass && rightElbowBack && punchFwd && punchNotSideways && chamberNotFwd && rOk;
+      // 握り込み確認: makeFist(curl=1)は4指×3関節すべてで理論値|z|=π/2≈1.571(rigFingers内部の
+      // normalizeRadians写像の最大応答点、本ケース冒頭の注記参照)。開き手(makeHand)由来の最大値
+      // (実測0.455、MCPの横開きに起因)を明確に上回るしきい値1.0radで判定する。
+      const fp = result.fp1 || {};
+      const gripKeys = ["IndexProximal", "IndexIntermediate", "IndexDistal", "MiddleProximal", "MiddleIntermediate", "MiddleDistal", "RingProximal", "RingIntermediate", "RingDistal", "LittleProximal", "LittleIntermediate", "LittleDistal"];
+      const gripVals = gripKeys.map((k) => fp[k]);
+      const gripMinAbs = gripVals.every((v) => v != null) ? Math.min(...gripVals.map(Math.abs)) : null;
+      const gripped = gripMinAbs != null && gripMinAbs > 1.0;
+      const pass = base.pass && rightElbowBack && punchFwd && punchNotSideways && chamberNotFwd && rOk && gripped;
       const detail =
         `${base.detail} / right.elbowZ=${fmt(rightElbowZ)}(要>0.03) / ` +
         `boneWorldProbe(突き腕=rightHand,引き手=leftHand): punchDz=${fmt(punchDz)}(要>0.30) ` +
         `punchOx=${fmt(punchOx)}(要|x|<0.20) chamberDz=${fmt(chamberDz)}(要<0.05) / ` +
-        `handAnchor.left.r=${fmt(result.r)}(理論1.4, ±10%)`;
+        `handAnchor.left.r=${fmt(result.r)}(理論1.4, ±10%) / ` +
+        `fingerProbe(right)全12関節中|z|最小=${fmt(gripMinAbs)}(要>1.0、理論値≈1.5708)`;
       return {
         pass,
         detail,
-        actual: { z1: result.z1, bw1: result.bw1, r: result.r },
+        actual: { z1: result.z1, bw1: result.bw1, fp1: result.fp1, r: result.r },
         expected: {
           "left.elbowZ": reachElbowZ(85),
           "left.wristZ": reachWristZ(85),
@@ -1165,19 +1188,22 @@ const CASES = [
           punchOx: "|x| < 0.20",
           chamberDz: "< +0.05",
           r: "1.4 ±10%",
+          gripMinAbs: "> 1.0 (理論≈1.5708)",
         },
       };
     },
     dryRunPreview() {
-      const chamberElbowZ = U * Math.sin(deg2rad(20));
+      const chamberElbowZ = U * Math.sin(deg2rad(40));
       return {
         "z1.left(突き,mediapipe13/15).elbowZ": reachElbowZ(85).toFixed(4),
         "z1.left(突き,mediapipe13/15).wristZ": reachWristZ(85).toFixed(4),
         "z1.right(引き手,mediapipe14/16).elbowZ": "+" + chamberElbowZ.toFixed(4) + " (>0.03)",
         note:
-          "CHAMBER_UA_DEG=20°/CHAMBER_FA_DEG=50°の閉形式導出はexpectations.md参照。Phase1(手較正無し)/Phase2(手較正あり)の2段階で検証。" +
+          "CHAMBER_UA_DEG=40°(g-fist1タスクで20°から変更、引き手ちらつきのsim限定安定化)/CHAMBER_FA_DEG=50°の" +
+          "閉形式導出はexpectations.md参照。Phase1(手較正無し)/Phase2(手較正あり)の2段階で検証。" +
           "boneWorldProbe(VRMボーン名)は突き腕=rightHand/引き手=leftHandが正(g-fix1タスクのKalidokitミラー規約修正後、実測で確定。expectations.md参照)。" +
-          "punchDz>0.30・punchOx(|rightHand.x-rightShoulder.x|)<0.20は実測(punchDz≈+0.378,punchOx≈-0.105)に対しマージンを持たせた値。",
+          "punchDz>0.30・punchOx(|rightHand.x-rightShoulder.x|)<0.20は実測(punchDz≈+0.378,punchOx≈-0.105)に対しマージンを持たせた値。" +
+          "gripMinAbs>1.0はmakeFist(g-fist1タスクで突き手をmakeHandから変更)が指を握り込んでいることの確認。",
       };
     },
   },
@@ -1334,6 +1360,71 @@ const CASES = [
           "punchOx≈-0.1086(いずれも分散ほぼ0)。修正前(git stashでg-fix1タスクの修正を外した状態)の" +
           "同じ経路での実測はpunchOx=-0.3774(横方向上限0.15を明確に超える、実機バグの再現)だった" +
           "ことも確認済み(本タスクの調査記録)。",
+      };
+    },
+  },
+  {
+    // g-fist1タスク新規ケース: 引き手(チャンバー)ちらつきのsim限定安定化の回帰ガード。
+    // 調査で判明した根本原因: resolveSign/zMag/updateBoneCalibrationの自己参照性ではなく、
+    // Kalidokit.Pose.solve内部のオイラー角分解が「上腕がほぼ鉛直(体側に沿って真下、CHAMBER_UA_DEGが
+    // 小さい)」な角度で数値的に不安定(gimbal-lock隣接領域)になること(__armProbeで上腕方向ベクトルを
+    // 直接観測すると、hips/chestが完全収束した後もleftUpperArmの向きだけが毎フレーム不規則に
+    // 大きく変わることを確認)。CHAMBER_UA_DEGを角度スイープ実測したところ33°→34°の間で不安定域を
+    // 抜け、34°以上は3回連続実行を含め分散0(完全静定)になることを確認したため、安全マージンを見て
+    // 40°を採用した(avatar-depth.htmlの該当コメント参照)。実カメラ経路が共有するresolveSign/
+    // updateBoneCalibration/armSagittal自体は一切変更していない(sim側のポーズ生成定数のみの変更)。
+    // 本ケースは実際の[data-sim="punch"]ボタン経路(cal=auto、new-punch-ui-autocalと同じ理由でフレッシュ
+    // ページを使う)で、引き手(leftHand)のhandZ-chestZを100ms間隔で2秒間サンプルし、値がほぼ一定
+    // (振れ幅が小さい)ことを検証する。修正前(CHAMBER_UA_DEG=20°)での実測はrange(max-min)≈0.297・
+    // stddev≈0.09〜0.13(本タスクの調査記録、git stashで再現確認済み)。
+    id: "new-punch-chamber-stability-autocal",
+    desc:
+      "[data-sim=\"punch\"]をUIクリック(cal=auto)後、引き手(leftHand)のhandZ-chestZを100ms間隔で2秒サンプル: " +
+      "振れ幅(range)が小さい(<0.02)。CHAMBER_UA_DEG=40°化(g-fist1タスク)によるちらつき解消の回帰ガード",
+    requiredHooks: ["__resetCalibration", "__boneWorldProbe"],
+    async run(page) {
+      // new-punch-ui-autocalと同じ理由(localStorageの較正残留を断つ)でフレッシュページを使う。
+      await evalHook(page, "__resetCalibration", []);
+      const freshPage = await page.context().newPage();
+      freshPage.on("pageerror", (err) => console.error("[page error]", err.message));
+      await freshPage.goto(page.url());
+      await freshPage.waitForFunction(() => window.__vrmReady === true, null, { timeout: 30000 });
+      await freshPage.click('[data-sim="punch"]');
+      await sleep(2000); // 較正(cal=auto)自体の収束を待つ(new-punch-ui-autocalと同じ4秒待ちの前半相当)
+      const samples = [];
+      for (let i = 0; i < 20; i++) {
+        // eslint-disable-next-line no-await-in-loop
+        await sleep(100);
+        // eslint-disable-next-line no-await-in-loop
+        const bw = await freshPage.evaluate((names) => window.__boneWorldProbe(names), ["leftHand", "chest"]);
+        samples.push(bw.leftHand && bw.chest ? bw.leftHand.z - bw.chest.z : null);
+      }
+      await freshPage.close();
+      return { samples };
+    },
+    assert(result) {
+      const vals = (result.samples || []).filter((v) => v != null && Number.isFinite(v));
+      const allFinite = vals.length === (result.samples || []).length && vals.length > 0;
+      const min = vals.length ? Math.min(...vals) : null;
+      const max = vals.length ? Math.max(...vals) : null;
+      const range = min != null && max != null ? max - min : null;
+      // しきい値0.02: 修正後の実測はrange=0.0000(3回連続実行で確認)。修正前の既知バグ値(range≈0.297)を
+      // 明確に弾きつつ、環境差(GPU/ブラウザバージョン)による無害な微小ジッターの余地は残す値。
+      const stable = range != null && range < 0.02;
+      const pass = allFinite && stable;
+      const detail = `samples=${vals.length} allFinite=${allFinite} range=${fmt(range)}(要<0.02) min=${fmt(min)} max=${fmt(max)}`;
+      return {
+        pass,
+        detail,
+        actual: { range, min, max, samples: result.samples },
+        expected: { allFinite: true, range: "< 0.02" },
+      };
+    },
+    dryRunPreview() {
+      return {
+        note:
+          "修正前(CHAMBER_UA_DEG=20°)での実測: range≈0.297・stddev≈0.09〜0.13(本タスクの調査記録)。" +
+          "修正後(40°)は3回連続実行いずれもrange=0.0000。しきい値0.02はこの間に十分なマージンを持つ値。",
       };
     },
   },

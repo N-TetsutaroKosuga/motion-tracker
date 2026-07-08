@@ -1994,6 +1994,70 @@
     L[1] = P(0.15, 0.30); L[2] = P(0.30, 0.45); L[3] = P(0.45, 0.55); L[4] = P(0.58, 0.62);
     return L;
   }
+  // ---- makeFist: 握った拳(グー)の手ランドマーク生成 ----
+  // 小さな3Dベクトル演算(makeFist専用。他の場所では{x,y,z}の生オブジェクトを直接演算しているため
+  // 汎用ヘルパーとしては切り出さず、ここでの利用に閉じる)。
+  const v3Add = (a, b) => ({ x: a.x + b.x, y: a.y + b.y, z: a.z + b.z });
+  const v3Scale = (a, k) => ({ x: a.x * k, y: a.y * k, z: a.z * k });
+  const v3Cross = (a, b) => ({ x: a.y * b.z - a.z * b.y, y: a.z * b.x - a.x * b.z, z: a.x * b.y - a.y * b.x });
+  const v3Norm = (a) => { const l = Math.hypot(a.x, a.y, a.z) || 1; return { x: a.x / l, y: a.y / l, z: a.z / l }; };
+  // 指を1本分、根本の実方向dir0(単位ベクトル)を起点に、関節ごとの曲げ角(累積, ラジアン)だけ
+  // 平面(dir0, n)内でnの側へ折り返した3点(第1関節先端・第2関節先端・第3関節先端)を返す。
+  // anglesRad=[0,0,0]なら常にdir0方向へ直進する＝makeHandの「まっすぐ伸びた指」と同じ形になる
+  // (makeFist(...,0)がmakeHandと同一形状になることの根拠。導出はtest/sim/expectations.md参照)。
+  function curlLinks(origin, dir0, n, lens, anglesRad) {
+    const pts = [];
+    let theta = 0, prev = origin;
+    for (let i = 0; i < lens.length; i++) {
+      theta += anglesRad[i];
+      const c = Math.cos(theta), sn = Math.sin(theta);
+      const dir = { x: c * dir0.x - sn * n.x, y: c * dir0.y - sn * n.y, z: c * dir0.z - sn * n.z };
+      const p = v3Add(prev, v3Scale(dir, lens[i]));
+      pts.push(p);
+      prev = p;
+    }
+    return pts;
+  }
+  // 拳(フィスト)の手ランドマーク生成: makeHandと同じ引数(W,f,s,sc)に加え、曲げ量curl(既定1)を取る。
+  // curl=0はmakeHandと同一形状(後方互換の基準)、curl=1で各指の3関節すべてが内角90°(=Kalidokitの
+  // rigFingers内部にあるnormalizeRadians写像—0°/180°で0、90°で最大0.5—にとって指の曲げ回転が最大に
+  // なる角度)になるよう折り返す。各指はMCP(手首から見た実方向dir0=normalize(0.45f+sd*s)、
+  // 指ごとの横オフセットsdを含む「実際の手首→MCP方向」を基準に取ることで、指の並び(横に開く分)による
+  // 誤差なく内角がちょうど180°-curl*90°になる)を基点に、PIP/DIPで手のひら側(法線n=f×sの一方)へ
+  // 90°ずつ折り返す。この配置は解析的に「TIP = MCP - 0.16sc*dir0」(nの寄与が対称に打ち消し合うため)
+  // になり、TIPがMCPより常に手首寄りに来ることを保証する(test/sim/expectations.md参照)。
+  // 親指はL[1]を基準点にし、同じ手法でやや控えめ(0.7倍角)に2関節折り返して指を覆う位置に寄せる。
+  function makeFist(W, f, s, sc, curl) {
+    const c = curl == null ? 1 : curl;
+    const n = v3Norm(v3Cross(f, s));
+    const A = (c * 90 * Math.PI) / 180;
+    const W3 = { x: W.x, y: W.y, z: W.z || 0 };
+    const L = new Array(21);
+    L[0] = { x: W3.x, y: W3.y, z: W3.z, visibility: 1 };
+    const fg = [[5, 6, 7, 8, 0.22], [9, 10, 11, 12, 0.07], [13, 14, 15, 16, -0.07], [17, 18, 19, 20, -0.22]];
+    const segLens = [(0.62 - 0.45) * sc, (0.78 - 0.62) * sc, (0.95 - 0.78) * sc];
+    for (const [mcp, pip, dip, tip, sd] of fg) {
+      const base = v3Add(v3Scale(f, 0.45), v3Scale(s, sd)); // 手首→MCPの実方向(正規化前)
+      const mcpPos = v3Add(W3, v3Scale(base, sc));
+      L[mcp] = { x: mcpPos.x, y: mcpPos.y, z: mcpPos.z, visibility: 1 };
+      const dir0 = v3Norm(base);
+      const [pPip, pDip, pTip] = curlLinks(mcpPos, dir0, n, segLens, [A, A, A]);
+      L[pip] = { x: pPip.x, y: pPip.y, z: pPip.z, visibility: 1 };
+      L[dip] = { x: pDip.x, y: pDip.y, z: pDip.z, visibility: 1 };
+      L[tip] = { x: pTip.x, y: pTip.y, z: pTip.z, visibility: 1 };
+    }
+    const thumbBase = v3Add(v3Scale(f, 0.15), v3Scale(s, 0.30));
+    const l1Pos = v3Add(W3, v3Scale(thumbBase, sc));
+    L[1] = { x: l1Pos.x, y: l1Pos.y, z: l1Pos.z, visibility: 1 };
+    const thumbDir0 = v3Norm(thumbBase);
+    const thumbLens = [(0.30 - 0.15) * sc, (0.45 - 0.30) * sc, (0.58 - 0.45) * sc];
+    const thumbA = A * 0.7;
+    const [pL2, pL3, pL4] = curlLinks(l1Pos, thumbDir0, n, thumbLens, [thumbA, thumbA, thumbA]);
+    L[2] = { x: pL2.x, y: pL2.y, z: pL2.z, visibility: 1 };
+    L[3] = { x: pL3.x, y: pL3.y, z: pL3.z, visibility: 1 };
+    L[4] = { x: pL4.x, y: pL4.y, z: pL4.z, visibility: 1 };
+    return L;
+  }
   function buildHandTest(dir) {
     const base = buildPoseElev(20); // 腕を少し上げて手が見える状態に
     const D = {
@@ -2061,7 +2125,22 @@
   //   上腕 = 肩 + U*(0, cos(CHAMBER_UA_DEG), sin(CHAMBER_UA_DEG))   … 体側で下向き+やや後方(+Z)
   //   前腕 = 肘 + F*(0, cos(CHAMBER_FA_DEG), -sin(CHAMBER_FA_DEG))  … 前下方、拳が腰脇の高さに来る
   // いずれもdx²+dy²+dz²=U²/F²を厳密に満たす(方向が単位ベクトルのため)。xは肩のxのまま(矢状面(y-z)内のみ)。
-  const CHAMBER_UA_DEG = 20, CHAMBER_FA_DEG = 50;
+  //
+  // CHAMBER_UA_DEG=40(旧20から変更、sim限定の安定化策・g-fist1タスク): 引き手のちらつき(cal=auto時に
+  // handZ-chestZが毎フレーム0.05〜0.35の間で暴れる)を実測で調査した結果、原因はresolveSign/zMag/
+  // updateBoneCalibrationの自己参照性(コメント参照)ではなく、Kalidokit.Pose.solveの内部的な
+  // オイラー角分解が「上腕がほぼ鉛直(体側に沿って真下)」に近い角度で数値的に不安定(gimbal-lock隣接)
+  // になることだと判明した(__armProbeで上腕方向ベクトルを直接観測すると、hips/chestが完全収束した後も
+  // leftUpperArmの向きだけが{0.02,-0.98,0.17}と{0.02,-0.39,0.92}の間を毎フレーム不規則に飛ぶことを確認。
+  // 実カメラ経路が共有するresolveSign/updateBoneCalibration自体には手を入れていない)。
+  // CHAMBER_UA_DEG(旧20°)を角度スイープで実測したところ33°→34°の間で不安定域から抜け出し、34°以上は
+  // 3回連続実行を含め分散0(完全に静定)になることを確認した(調査記録: 20°/30°/31°/32°/33°でstddev
+  // 0.06〜0.13、34°以上でstddev=0.0000)。安全マージンを見て40°を採用(34°ちょうどだと環境差で再び
+  // 境界に踏み込むリスクがあるため)。手動較正(cal=manual)時はzMag(肘)=U*sinθが角度とともに単調増加
+  // するだけなので40°への変更で悪化しない(実測: chamberDz=-0.055(20°)→-0.048(40°)、
+  // right.elbowZ=U*sinθ=0.092(20°)→0.174(40°)、いずれも既存閾値内)。CHAMBER_FA_DEGは50°のまま
+  // (この不安定化には無関係だったため変更不要、実測で確認済み)。
+  const CHAMBER_UA_DEG = 40, CHAMBER_FA_DEG = 50;
   function chamberUaDir() { const r = (CHAMBER_UA_DEG * Math.PI) / 180; return { x: 0, y: Math.cos(r), z: Math.sin(r) }; }
   function chamberFaDir() { const r = (CHAMBER_FA_DEG * Math.PI) / 180; return { x: 0, y: Math.cos(r), z: -Math.sin(r) }; }
   // 突き腕の方向(単位ベクトル)。buildPoseReachと同じ規約(拳の高さ=肩の高さ、-Z方向へ伸展)。
@@ -2122,7 +2201,8 @@
     const wIdx = punchLeft ? 15 : 16;
     const w = out.poseLandmarks[0][wIdx];
     const f = { x: 0, y: 0, z: -1 }, s = punchLeft ? { x: -1, y: 0, z: 0 } : { x: 1, y: 0, z: 0 };
-    const hand = [makeHand({ x: w.x, y: w.y, z: 0 }, f, s, 0.12 * hs)];
+    // 正拳突きなので突き手は開いた手(makeHand)ではなく握った拳(makeFist)を付与する。
+    const hand = [makeFist({ x: w.x, y: w.y, z: 0 }, f, s, 0.12 * hs)];
     out.leftHandLandmarks = punchLeft ? hand : [];
     out.rightHandLandmarks = punchLeft ? [] : hand;
     return out;
@@ -2166,7 +2246,8 @@
     const wIdx = activeLeft ? 15 : 16;
     const w = out.poseLandmarks[0][wIdx];
     const f = { x: 0, y: 0, z: -1 }, s = activeLeft ? { x: -1, y: 0, z: 0 } : { x: 1, y: 0, z: 0 };
-    const hand = [makeHand({ x: w.x, y: w.y, z: 0 }, f, s, 0.12 * 1.4)]; // アクティブ(突き)側にだけ手を付与
+    // アクティブ(突き)側にだけ握った拳(makeFist)を付与(buildPosePunchと同じ理由、makeHandは開き手用)
+    const hand = [makeFist({ x: w.x, y: w.y, z: 0 }, f, s, 0.12 * 1.4)];
     out.leftHandLandmarks = activeLeft ? hand : [];
     out.rightHandLandmarks = activeLeft ? [] : hand;
     return out;
@@ -2215,6 +2296,23 @@
       const p = new THREE.Vector3();
       node.getWorldPosition(p);
       out[n] = { x: p.x, y: p.y, z: p.z };
+    }
+    return out;
+  };
+  // ヘッドレス検証用(読み取り専用): 指定側(vrmSide: "left"|"right")の全指ボーンのローカルz回転(ラジアン)を
+  // 返す。rigHand適用後の実際のボーン回転を直接見るためのフック(makeFistが指を曲げているかどうかの
+  // 数値確認用。判定ロジックには一切関与しない)。値が大きい(|z|が大)ほど深く曲がっている
+  // (rigFingers内部の規約: 開いた指はz≈0、握った指は|z|が大きい負の値、既存コード解説はrigHand周辺参照)。
+  window.__fingerProbe = (vrmSide) => {
+    if (!currentVrm) return null;
+    const out = {};
+    for (const f of FINGERS) for (const s of SEGS) {
+      const node = currentVrm.humanoid.getNormalizedBoneNode(vrmSide + f + s);
+      out[f + s] = node ? node.rotation.z : null;
+    }
+    for (const [, vv] of THUMB_MAP) {
+      const node = currentVrm.humanoid.getNormalizedBoneNode(vrmSide + vv);
+      out[vv] = node ? node.rotation.z : null;
     }
     return out;
   };
