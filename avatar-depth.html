@@ -215,7 +215,7 @@
         <button class="btn-ghost" data-sim="punchcycle">正拳突き（連続）</button>
         <button class="btn-ghost" data-sim="">解除</button>
       </div>
-      <div class="note" style="margin-top:6px">正拳突きの引き手（構え側の腕）は未キャリブレーション状態だと安定しにくいことがあります。事前にキャリブレーションすると改善します。</div>
+      <div class="note" style="margin-top:6px">正拳突きは正面だと腕が短く見えます（正しい遠近）。選択時は側面ビューに切り替わり、前後の伸びを確認できます。引き手は未キャリブレーションだと不安定なことがあります。</div>
     </div>
 
     <div class="note">ドラッグで回転・ホイールでズーム。全身が映る距離で立つと脚まで安定します。</div>
@@ -427,6 +427,13 @@
     SWIVEL_OUT: 0.6, SWIVEL_DOWN: 0.8, // 低visibility時の自然姿勢バイアス係数（外側・下方向）
     ELBOW_VIS_MIN: 0.5,    // このvisibility以上なら観測された肘位置をスイベル方向の根拠に使う
     D_MAX_RATIO: 0.995,    // 肩-手首距離dのクランプ比率（L_ua+L_faに対して。特異点回避）
+    // 幾何チェーンとの整合ゲート: 高リーチ(ρ大)なのに手サイズ由来の|dz|がチェーン|Δz|より
+    // 大幅に小さいとき、較正不一致(拳/開き手・距離・D0誤差)で前方リーチを潰しているとみなして
+    // 手アンカーを棄却する。実測(正拳突きシム+手較正残留): r=1.05→Δz=0.04 で w=1 になり
+    // 幾何の wristZ≈-0.42 を上書きし、アバターが「右腕 中立」のまま拳が肩前で止まる症状を確認。
+    CHAIN_AGREE_RHO: 0.35,     // これ以上のリーチ度でのみゲートを見る
+    CHAIN_AGREE_MIN: 0.12,     // チェーン|Δz|がこれ未満なら幾何側も弱いのでゲートしない[m]
+    CHAIN_AGREE_RATIO: 0.45,   // |dz_ha| < チェーン|Δz| * この比率 なら棄却
   };
   let HAND_ANCHOR_ENABLED = true; // 設定パネルのトグル・__setHandAnchorで変更（ハイブリッド時のみ有効）
   window.__setHandAnchor = (on) => {
@@ -552,8 +559,18 @@
   }
   let ONE_EURO_MINCUTOFF = 1.0, ONE_EURO_BETA = 0.3;
   const oneEuroFilters = {}; // idx(11-16) -> OneEuroFilter
+  // 合成ポーズ(sim)はノイズ無しの真値なので、実カメラ向けの One Euro 遅延を掛けると
+  // 正拳突きサイクル等の速い往復でアバターがピーク伸展に届かなくなる
+  // (実測: 静止パンチ punchDz≈0.40 / arm.z≈1.0 に対し、周期800msサイクルでは
+  //  peak punchDz≈0.22 / arm.z≈0.19 までしか上がらない)。sim 中はパススルーし、
+  // フィルタ内部状態だけ最新値に同期してカメラ復帰時の飛びを防ぐ。
   function oneEuro(idx, value, nowMs) {
     if (!oneEuroFilters[idx]) oneEuroFilters[idx] = new OneEuroFilter(30, ONE_EURO_MINCUTOFF, ONE_EURO_BETA, 1.0);
+    if (simResult) {
+      const f = oneEuroFilters[idx];
+      f.xPrev = value; f.dxPrev = 0; f.tPrev = nowMs / 1000;
+      return value;
+    }
     return oneEuroFilters[idx].filter(value, nowMs / 1000);
   }
 
@@ -681,7 +698,10 @@
   const b3DebugState = { left: { ua: { rho: 0, blended: false }, fa: { rho: 0, blended: false } }, right: { ua: { rho: 0, blended: false }, fa: { rho: 0, blended: false } } };
   function updateReachRatio(side, key, raw, dt) {
     const target = smoothstep(raw, HZ.REACH_BLEND_LO, HZ.REACH_BLEND_HI);
-    const next = expLerp(reachRatioState[side][key], target, dt, HZ.REACH_BLEND_TAU);
+    // sim の速い往復では REACH_BLEND_TAU(0.15s)だとρがピークに追従しきれず B3 直接quatが
+    // 間に合わない(周期800msの半周期=400msに対し時定数が大きすぎる)。合成ポーズ中は短い時定数にする。
+    const tau = simResult ? Math.min(HZ.REACH_BLEND_TAU, 0.04) : HZ.REACH_BLEND_TAU;
+    const next = expLerp(reachRatioState[side][key], target, dt, tau);
     reachRatioState[side][key] = next;
     return next;
   }
@@ -1280,7 +1300,16 @@
     // 品質ゲート（マッチ成功・r有効・手のvisibility）。手のvisibilityはtasks-visionでは欠損時nullのことが
     // あるためvisOk相当(null=許可)で判定する。
     const handVisOk = !matched || hand[0].visibility == null || hand[0].visibility >= HZ.VIS_GATE_MIN;
-    const quality = matched && r != null && dz != null && handVisOk;
+    // 幾何チェーンとの整合: 肩→手首のチェーンΔz(肘+手首のzMag合計)と手サイズdzが大きく食い違う
+    // 場合は較正不一致とみなし、手アンカーを無効化して幾何側を残す。
+    const chainDzMag = Math.abs((shoulderZRef[shoulder] ?? 0) - wristZChain);
+    const haUnderestimates =
+      dz != null &&
+      rho >= HA.CHAIN_AGREE_RHO &&
+      chainDzMag >= HA.CHAIN_AGREE_MIN &&
+      Math.abs(dz) < chainDzMag * HA.CHAIN_AGREE_RATIO;
+    if (haUnderestimates) lastValidAnchor[wrist] = null; // 過小ΔzのIKをフェードキャッシュに残さない
+    const quality = matched && r != null && dz != null && handVisOk && !haUnderestimates;
 
     // ---- ブレンド重みw：リーチ度ρのsmoothstep × 手品質。時定数HA.W_TAUのexpLerpでポップ防止 ----
     const wRaw = quality ? smoothstep(rho, HA.RHO_LO, HA.RHO_HI) : 0;
@@ -1291,7 +1320,7 @@
     // dz未確定時はアンカー値=チェーン値にしておく（wがまだ減衰しきっていない過渡期でも安全＝ブレンドが恒等になる）
     let elbowX = world[elbow].x, elbowY = world[elbow].y, elbowZ = elbowZChain, wristZ = wristZChain, elbowDeg = null;
 
-    if (dz != null) {
+    if (dz != null && !haUnderestimates) {
       const anchorWristZ = shoulderZRef[shoulder] - dz; // MediaPipe world: -zがカメラ手前
       const S = { x: world[shoulder].x, y: world[shoulder].y, z: shoulderZRef[shoulder] };
       const W = { x: world[wrist].x, y: world[wrist].y, z: anchorWristZ };
@@ -1646,13 +1675,21 @@
     const cur = sagAngle[side];
     if (raw == null) return cur; // メカニズムC(ii): 特異点フレーム(呼び出し側がnullを渡す)は直近の確定角を保持する
     const delta = wrapAngleDelta(raw - cur);
-    if (Math.abs(delta) < HZ.SAG_DEADZONE) return cur; // 前回確定角から近い変化は無視（ジッター抑制）
-    const clamped = Math.max(-HZ.SAG_MAX_RATE, Math.min(HZ.SAG_MAX_RATE, delta));
+    // 合成ポーズはノイズ無しなので不感帯・スルーレートを緩める(速い突きサイクルの追従用)。
+    // 実カメラ経路は従来どおり SAG_DEADZONE / SAG_MAX_RATE。
+    const deadzone = simResult ? 0.02 : HZ.SAG_DEADZONE;
+    const maxRate = simResult ? 1.0 : HZ.SAG_MAX_RATE;
+    if (Math.abs(delta) < deadzone) return cur; // 前回確定角から近い変化は無視（ジッター抑制）
+    const clamped = Math.max(-maxRate, Math.min(maxRate, delta));
     sagAngle[side] = wrapAngleDelta(cur + clamped); // 状態自体も(-π,π]に保つ
     return sagAngle[side];
   }
   // 腕ボーンのslerp係数を信頼度(visibility)連動にする（ハイブリッド方式のみ。低visibility時は小さく）
   function armSlerpFactor(idxA, idxB, world) {
+    // 合成ポーズは真値が毎フレーム確定しているので、SMOOTH=0.3 のフレーム数ベース遅延だと
+    // 正拳突きサイクルのピークにアバターが届かない。sim 中は腕だけ高追従にする
+    // (体幹・脚は従来どおり SMOOTH。実カメラ経路は不変)。
+    if (simResult) return Math.max(SMOOTH, 0.9);
     if (Z_METHOD !== "hybrid" || visGateDisabled) return SMOOTH;
     const va = world && world[idxA] ? world[idxA].visibility : null;
     const vb = world && world[idxB] ? world[idxB].visibility : null;
@@ -2040,11 +2077,20 @@
   function setSim(name) {
     simAnimator = null; // 新しいポーズを選ぶ・解除するいずれの場合も進行中のアニメーションは停止する
     if (name === "punchcycle") {
-      window.__simPunchCycle();
+      // UIデモでは visDip を切る。visDip=true(既定)は突きピークで visibility を0.3まで下げ、
+      // ヒステリシスゲートが z を凍結するためアバターがフル伸展に届かない
+      // (実測: peak punchDz≈0.22 / arm.z≈0.25。visDip=false なら ≈0.40 / 1.0)。
+      // ゲート作動の回帰は test/sim の new-punch-cycle が visDip 既定ONで別途検証する。
+      window.__simPunchCycle({ visDip: false });
     } else {
       simResult = name ? (name === "punch" ? buildPosePunch("left", 85) : buildPose(name)) : null;
     }
     [...document.querySelectorAll("[data-sim]")].forEach((b) => b.classList.toggle("active", b.dataset.sim === name));
+    // 正拳突きは正面だと正しい遠近で腕が短く見え、「奥行きが効いていない」と誤認しやすい。
+    // 前後(z)の確認用に側面ビューへ自動切替する(解除・他ポーズでは正面に戻す)。
+    if (typeof setSideView === "function") {
+      setSideView(name === "punch" || name === "punchcycle");
+    }
   }
   window.__simPose = setSim;                       // ヘッドレス自己検証フック
   window.__poseNames = ["down", "up", "tpose", "leftup"];
@@ -2626,19 +2672,20 @@
     camera.position.copy(DEFAULT_CAM);
     controls.target.copy(LOOK_AT);
     controls.update();
-    sideViewOn = false;
-    toggleSideViewBtn.classList.remove("active");
-    toggleSideViewBtn.setAttribute("aria-pressed", "false");
+    setSideView(false);
   });
   // 側面ビュー確認UI(g1タスク): 既存の__view()とOrbitControlsをそのまま利用し、
   // 正面(0°)⇔真横(90°)をワンボタンで切り替える。前後(z)が正しいかを目視確認するための機能で、
   // 判定ロジックには一切関与しない(__viewは表示用カメラ位置と補助照明を動かすだけ)。
   let sideViewOn = false;
-  toggleSideViewBtn.addEventListener("click", () => {
-    sideViewOn = !sideViewOn;
+  function setSideView(on) {
+    sideViewOn = !!on;
     window.__view(sideViewOn ? 90 : 0);
     toggleSideViewBtn.classList.toggle("active", sideViewOn);
     toggleSideViewBtn.setAttribute("aria-pressed", String(sideViewOn));
+  }
+  toggleSideViewBtn.addEventListener("click", () => {
+    setSideView(!sideViewOn);
   });
   smoothInput.addEventListener("input", () => {
     SMOOTH = parseFloat(smoothInput.value);

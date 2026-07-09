@@ -1652,7 +1652,10 @@ const CASES = [
       await sleep(2500);
 
       // 実際にreachさせて手アンカーが発火するか確認する。
-      await evalHook(page, "__simReachHand", [60, 1]);
+      // handScale=1.4: 較正基準(scale=1)より大きく見せて r≈1.4・有意なΔz を出し、
+      // 幾何チェーンとの整合ゲート(CHAIN_AGREE_*)を通過させる。scale=1(r=1,Δz=0)だと
+      // 高リーチ時に「幾何は前・手サイズはΔz≈0」の不一致としてゲートが棄却するのが正しい挙動。
+      await evalHook(page, "__simReachHand", [60, 1.4]);
       const conv = await pollUntilStable(page);
       const handAnchor = conv.probe?.handAnchor?.left ?? null;
       return { afterManualCal, handAnchor };

@@ -57,7 +57,8 @@ python3 -m http.server 8000
 
 `test/` 配下にNode 24 + Playwrightの自動テストがあります（`npm install` 必要）。
 
-- `node test/sim/run.mjs` — 奥行きポーズのシミュレーションテスト（`avatar-depth.html`のハイブリッドz/手アンカーを理論値と突き合わせ、10ケース）
+- `node test/sim/run.mjs` — 奥行きポーズのシミュレーションテスト（`avatar-depth.html`のハイブリッドz/手アンカーを理論値と突き合わせ、26ケース）
+- `node test/sim/avatar-reflect.mjs` — シム姿勢がVRMアバター骨に正しく反映されるかを検証（前後/上下/左右・UIボタン・正拳突きサイクルのピーク追従）。スクリーンショットは `test/sim/out/avatar-reflect-shots/`
 - `node test/tracking/fetch-media.mjs` — テスト映像（Pexels）の取得とY4M変換
 - `node test/tracking/run.mjs` — Chromiumのフェイクカメラで`verify.html`にテスト映像を流し込み、不変量チェック（`checks.mjs`）まで自動実行
 - `test/tracking/crosscheck/` — Python版MediaPipe（同一.taskモデル）とのクロスチェック（python3.11必要）。`bash setup.sh` → `.venv/bin/python extract.py` → `.venv/bin/python compare.py`
